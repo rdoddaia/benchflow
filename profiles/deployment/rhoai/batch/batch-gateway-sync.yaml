@@ -23,7 +23,12 @@ spec:
     env:
       USER: benchflow
     vllm_args:
-      - --max-model-len=131072
+      # Qwen3-32B's config caps max_position_embeddings at 40960; vLLM
+      # refuses a larger max-model-len unless the model itself is
+      # YaRN-scaled (the legacy batch-bench stack serves a local
+      # Qwen-Qwen3-32B-yarn copy for 131072). These profiles serve the
+      # plain cached model, so they stay at the native context length.
+      - --max-model-len=40960
       - --max-num-seqs=256
       - --gpu-memory-utilization=0.90
       - --trust-remote-code

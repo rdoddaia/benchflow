@@ -33,8 +33,10 @@ Two deployment profiles exercise the two dispatch modes:
 Both pin `RHOAI-3.5.0` / channel `stable-3.5` — the stable line the upstream
 deploy-rhoai.md recipe targets, whose operator already ships the batch-gateway
 operator (`aigateway.batchGateway`) — and mirror the Diadochos serving runtime
-(Qwen3-32B, TP8, vLLM 0.31.0, `max_num_seqs=256`). The exact version pin keeps
-the installed-key fast path matching the cluster's recorded platform state.
+(Qwen3-32B, TP8, vLLM 0.31.0, `max_num_seqs=256`, native 40960 context — the
+legacy stack reaches 131072 only via a locally YaRN-scaled model copy). The
+exact version pin keeps the installed-key fast path matching the cluster's
+recorded platform state.
 
 Example experiments: `experiments/rhoai/batch/batch-gateway-{sync,async}.yaml`.
 They disable the benchmark stage because the batch drivers are external.
