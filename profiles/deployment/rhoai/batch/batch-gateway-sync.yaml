@@ -10,8 +10,8 @@ metadata:
 spec:
   platform: rhoai
   mode: distributed-default
-  platform_version: RHOAI-3.6.0-ea.2
-  platform_channel: beta
+  platform_version: RHOAI-3.5.0
+  platform_channel: stable-3.5
   endpoint_path: /v1/models
   model_storage:
     pvc_name: models-storage
@@ -41,3 +41,7 @@ spec:
           # claim_name defaults to <release>-batch-gateway-files; BenchFlow
           # creates the 20Gi ReadWriteMany PVC when it does not exist.
           base_path: /tmp/batch-gateway
+          # The PVC must be ReadWriteMany; pin the class on clusters whose
+          # default StorageClass is block/RWO (Diadochos defaults to
+          # ibmc-vpc-block, so the profiles pin its CephFS class).
+          storage_class_name: rook-cephfs-fast

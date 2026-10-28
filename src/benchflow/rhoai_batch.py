@@ -101,6 +101,10 @@ class BatchGatewaySpec:
     def fs_base_path(self) -> str:
         return str(self.file_storage.get("fs", {}).get("base_path") or "")
 
+    @property
+    def fs_storage_class_name(self) -> str:
+        return str(self.file_storage.get("fs", {}).get("storage_class_name") or "")
+
 
 def _scoped_name(release_name: str, suffix: str) -> str:
     candidate = f"{release_name}-{suffix}"
@@ -170,7 +174,7 @@ def _parse_file_storage(raw: Any) -> dict[str, Any]:
     fs = raw["fs"]
     if not isinstance(fs, dict):
         raise ValidationError("options.batch_gateway.file_storage.fs must be a mapping")
-    unknown = sorted(set(fs) - {"claim_name", "base_path"})
+    unknown = sorted(set(fs) - {"claim_name", "base_path", "storage_class_name"})
     if unknown:
         raise ValidationError(
             "options.batch_gateway.file_storage.fs contains unsupported fields: "
@@ -180,6 +184,7 @@ def _parse_file_storage(raw: Any) -> dict[str, Any]:
         "fs": {
             "claim_name": str(fs.get("claim_name") or "").strip(),
             "base_path": str(fs.get("base_path") or "/tmp/batch-gateway").strip(),
+            "storage_class_name": str(fs.get("storage_class_name") or "").strip(),
         }
     }
 
@@ -638,6 +643,15 @@ def rhoai_batch_endpoint_url(kubectl_cmd: str, plan: ResolvedRunPlan) -> str:
             "json",
         ]
     )
+    # The OpenShift router routes by SNI, so the listener hostname is the
+    # client-usable address; the status address is the raw load balancer
+    # behind it and does not route on its own.
+    for listener in (payload.get("spec") or {}).get("listeners") or []:
+        if not isinstance(listener, dict):
+            continue
+        hostname = str(listener.get("hostname") or "").strip()
+        if hostname:
+            return f"https://{hostname}".rstrip("/")
     addresses = (payload.get("status") or {}).get("addresses") or []
     for address in addresses:
         if not isinstance(address, dict):
@@ -1040,8 +1054,9 @@ def render_batch_files_pvc_manifest(
     plan: ResolvedRunPlan,
     *,
     claim_name: str,
+    storage_class_name: str = "",
 ) -> dict[str, Any]:
-    return {
+    manifest = {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {
@@ -1054,6 +1069,9 @@ def render_batch_files_pvc_manifest(
             "resources": {"requests": {"storage": BATCH_FILES_PVC_SIZE}},
         },
     }
+    if storage_class_name:
+        manifest["spec"]["storageClassName"] = storage_class_name
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -1172,12 +1190,22 @@ def _ensure_file_storage_pvc(
     if result.returncode == 0:
         detail(f"Reusing batch files PVC {claim_name}")
         return
-    manifest = render_batch_files_pvc_manifest(plan, claim_name=claim_name)
+    manifest = render_batch_files_pvc_manifest(
+        plan,
+        claim_name=claim_name,
+        storage_class_name=spec.fs_storage_class_name,
+    )
     _apply_manifest(kubectl_cmd, manifest)
     _write_manifest(manifests_dir, "batch-files-pvc.yaml", manifest)
+    storage_class_detail = (
+        f", storageClassName {spec.fs_storage_class_name}"
+        if spec.fs_storage_class_name
+        else ""
+    )
     detail(
         f"Created batch files PVC {claim_name} "
-        f"({BATCH_FILES_PVC_SIZE} {','.join(BATCH_FILES_PVC_ACCESS_MODES)})"
+        f"({BATCH_FILES_PVC_SIZE} {','.join(BATCH_FILES_PVC_ACCESS_MODES)}"
+        f"{storage_class_detail})"
     )
 
 

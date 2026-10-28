@@ -10,13 +10,18 @@ from benchflow.rhoai_batch import (
     batch_route_name,
     llmbatchgateway_name,
     parse_batch_gateway_options,
+    render_batch_files_pvc_manifest,
     render_batch_internal_gateway_manifest,
     render_batch_llm_route_manifest,
     render_batch_route_manifests,
     render_llmbatchgateway_manifest,
+    rhoai_batch_endpoint_url,
     rhoai_batch_gateway_spec,
 )
-from benchflow.rhoai_gateway import RhoaiGatewayConfiguration
+from benchflow.rhoai_gateway import (
+    RhoaiGatewayConfiguration,
+    rhoai_release_gateway_name,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,8 +64,8 @@ def test_batch_experiments_resolve_with_batch_profiles() -> None:
         assert plan.profiles.deployment == profile
         assert plan.deployment.platform == "rhoai"
         assert plan.deployment.mode == "distributed-default"
-        assert plan.deployment.platform_version == "RHOAI-3.6.0-ea.2"
-        assert plan.deployment.platform_channel == "beta"
+        assert plan.deployment.platform_version == "RHOAI-3.5.0"
+        assert plan.deployment.platform_channel == "stable-3.5"
         assert "batch_gateway" in plan.deployment.options
         assert plan.stages.benchmark is False
 
@@ -133,6 +138,63 @@ def test_parse_batch_gateway_options_requires_async_config_for_async() -> None:
         )
 
 
+def test_parse_file_storage_fs_storage_class_name() -> None:
+    parsed = parse_batch_gateway_options(
+        {
+            "secret_name": "s",
+            "file_storage": {"fs": {"storage_class_name": "rook-cephfs-fast"}},
+        }
+    )
+    assert parsed["file_storage"]["fs"]["storage_class_name"] == "rook-cephfs-fast"
+    defaulted = parse_batch_gateway_options(
+        {"secret_name": "s", "file_storage": {"fs": {}}}
+    )
+    assert defaulted["file_storage"]["fs"]["storage_class_name"] == ""
+    with pytest.raises(ValidationError, match="unsupported fields: zone"):
+        parse_batch_gateway_options(
+            {"secret_name": "s", "file_storage": {"fs": {"zone": "a"}}}
+        )
+
+
+def test_render_batch_files_pvc_manifest_storage_class() -> None:
+    plan = _plans("batch-gateway-sync")[0]
+    manifest = render_batch_files_pvc_manifest(
+        plan, claim_name="files", storage_class_name="rook-cephfs-fast"
+    )
+    assert manifest["kind"] == "PersistentVolumeClaim"
+    assert manifest["spec"]["accessModes"] == ["ReadWriteMany"]
+    assert manifest["spec"]["storageClassName"] == "rook-cephfs-fast"
+    defaulted = render_batch_files_pvc_manifest(plan, claim_name="files")
+    assert "storageClassName" not in defaulted["spec"]
+
+
+def test_rhoai_batch_endpoint_url_prefers_listener_hostname(monkeypatch) -> None:
+    plan = _plans("batch-gateway-sync")[0]
+
+    def fake_run_json_command(argv):
+        assert argv[1:4] == ["get", "gateway", rhoai_release_gateway_name(plan)]
+        return {
+            "spec": {"listeners": [{"hostname": "gw.example.apps.cluster.com"}]},
+            "status": {"addresses": [{"value": "raw-lb.example.com"}]},
+        }
+
+    monkeypatch.setattr("benchflow.rhoai_batch.run_json_command", fake_run_json_command)
+    assert rhoai_batch_endpoint_url("oc", plan) == "https://gw.example.apps.cluster.com"
+
+
+def test_rhoai_batch_endpoint_url_falls_back_to_status_address(monkeypatch) -> None:
+    plan = _plans("batch-gateway-sync")[0]
+
+    def fake_run_json_command(argv):
+        return {
+            "spec": {"listeners": [{"hostname": ""}]},
+            "status": {"addresses": [{"value": "http://raw-lb.example.com"}]},
+        }
+
+    monkeypatch.setattr("benchflow.rhoai_batch.run_json_command", fake_run_json_command)
+    assert rhoai_batch_endpoint_url("oc", plan) == "http://raw-lb.example.com"
+
+
 def test_spec_fills_release_scoped_defaults() -> None:
     plan = _plans("batch-gateway-sync")[0]
     spec = rhoai_batch_gateway_spec(plan)
@@ -141,6 +203,7 @@ def test_spec_fills_release_scoped_defaults() -> None:
     assert spec.inference_objective == f"{release}-batch-sheddable"
     assert spec.fs_claim_name == f"{release}-batch-gateway-files"
     assert spec.fs_base_path == "/tmp/batch-gateway"
+    assert spec.fs_storage_class_name == "rook-cephfs-fast"
     assert spec.secret_name == "batch-gateway-secrets"
 
 

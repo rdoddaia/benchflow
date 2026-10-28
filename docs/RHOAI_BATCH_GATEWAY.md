@@ -30,9 +30,11 @@ Two deployment profiles exercise the two dispatch modes:
   it needs no Prometheus. Set the queue `gateType` to `prometheus-budget` and
   add `prometheusURL` for flow-control-based dispatch.
 
-Both pin `RHOAI-3.6.0-ea.2` / channel `beta`, the first RHOAI release whose
-operator ships the batch gateway operator, and mirror the Diadochos serving
-runtime (Qwen3-32B, TP8, vLLM 0.31.0, `max_num_seqs=256`).
+Both pin `RHOAI-3.5.0` / channel `stable-3.5` — the stable line the upstream
+deploy-rhoai.md recipe targets, whose operator already ships the batch-gateway
+operator (`aigateway.batchGateway`) — and mirror the Diadochos serving runtime
+(Qwen3-32B, TP8, vLLM 0.31.0, `max_num_seqs=256`). The exact version pin keeps
+the installed-key fast path matching the cluster's recorded platform state.
 
 Example experiments: `experiments/rhoai/batch/batch-gateway-{sync,async}.yaml`.
 They disable the benchmark stage because the batch drivers are external.
@@ -77,7 +79,10 @@ the release Gateway and the bootstrap Gateway are never touched.
   DestinationRule (TLS re-encrypt, `insecureSkipVerify`) only when
   `options.batch_gateway.tls.enabled` is set.
 - A **20Gi ReadWriteMany PVC** for `file_storage.fs` when the claim does not
-  exist. The default claim name is `<release>-batch-gateway-files`.
+  exist. The default claim name is `<release>-batch-gateway-files`. Set
+  `file_storage.fs.storage_class_name` when the cluster's default
+  StorageClass cannot serve `ReadWriteMany` (Diadochos defaults to a block
+  RWO class, so the profiles pin `rook-cephfs-fast`).
 
 CRD group drift is handled by runtime discovery: `LLMBatchGateway`
 (`batch.llm-d.ai` then `llm-d.ai`, preferring `v1alpha1`), `InferenceObjective`
@@ -106,7 +111,10 @@ disabled.
 ## Driving the batch API
 
 The deploy stage ends by printing the batch endpoint
-(`<release-gateway-address>/v1/batches`). Authenticate with a Kubernetes
+(`https://<release-gateway-listener-hostname>/v1/batches`, falling back to the
+gateway status address when no listener hostname is set — the OpenShift router
+routes by SNI, so the listener hostname is the client-usable address).
+Authenticate with a Kubernetes
 service-account token; when the Kuadrant AuthPolicies are enforced, the token's
 user must also be allowed to `get` the target `llminferenceservices` resource
 (the model-level SubjectAccessReview on the internal route).
@@ -125,7 +133,7 @@ a first-party batch benchmark it will live in
 | --- | --- | --- |
 | `secret_name` | required | pre-existing Secret with `redis-url`, `postgresql-url` |
 | `db_backend` | `postgresql` | `postgresql` or `redis` |
-| `file_storage` | required | exactly one of `fs` (`claim_name`, `base_path`) or `s3` (verbatim CR passthrough) |
+| `file_storage` | required | exactly one of `fs` (`claim_name`, `base_path`, `storage_class_name`) or `s3` (verbatim CR passthrough) |
 | `dispatch_mode` | `sync` | `sync` or `async` |
 | `api_server_replicas` | `1` | |
 | `processor_replicas` | `1` | |

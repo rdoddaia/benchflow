@@ -19,6 +19,19 @@ spec:
   stages:
     # BenchFlow does not drive the /v1/batches API itself yet.
     benchmark: false
+  overrides:
+    runtime:
+      # Diadochos validation is pinned to mt46x; its 8 H100s are freed by
+      # scaling the legacy cybergym-vllm deployment in batch-bench to zero.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - diadochos-hqxzk-gpu-h100-mt46x
   mlflow:
     tags:
       accelerator: H100
