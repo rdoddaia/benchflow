@@ -1,0 +1,70 @@
+# Operator-managed RHOAI batch gateway, async dispatch. The processor enqueues
+# requests in Redis and the operator-deployed async-processor drains them
+# through the same internal Gateway. This profile uses local-max-concurrency
+# gates only, so it needs no Prometheus scraping EPP or vLLM metrics; swap the
+# queue gateType to prometheus-budget (and add prometheusURL) for flow-control
+# based dispatch. Requires the batch-gateway-secrets Secret (redis-url,
+# postgresql-url) in the deployment namespace; see docs/RHOAI_BATCH_GATEWAY.md.
+apiVersion: benchflow.io/v1alpha1
+kind: DeploymentProfile
+metadata:
+  name: batch-gateway-async
+spec:
+  platform: rhoai
+  mode: distributed-default
+  platform_version: RHOAI-3.6.0-ea.2
+  platform_channel: beta
+  endpoint_path: /v1/models
+  model_storage:
+    pvc_name: models-storage
+    cache_dir: /models
+  runtime:
+    image: vllm/vllm-openai:v0.31.0
+    replicas: 1
+    tensor_parallelism: 8
+    env:
+      USER: benchflow
+    vllm_args:
+      - --max-model-len=131072
+      - --max-num-seqs=256
+      - --gpu-memory-utilization=0.90
+      - --trust-remote-code
+      - --no-enable-log-requests
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+  options:
+    enable_auth: false
+    batch_gateway:
+      secret_name: batch-gateway-secrets
+      db_backend: postgresql
+      dispatch_mode: async
+      file_storage:
+        fs:
+          # claim_name defaults to <release>-batch-gateway-files; BenchFlow
+          # creates the 20Gi ReadWriteMany PVC when it does not exist.
+          base_path: /tmp/batch-gateway
+      # async_config passes through to the LLMBatchGateway CR except that
+      # BenchFlow fills in release-derived fields the profile cannot know:
+      # each queue's name, igwBaseURL, and (for prometheus-budget gates) the
+      # gateParams pool and namespace.
+      async_config:
+        replicas: 1
+        redis:
+          requestPathURL: /v1/chat/completions
+          pollIntervalMs: 500
+          batchSize: 10
+          queuesConfig:
+            - requestPathURL: /v1/chat/completions
+              # Queue gate caps in-flight dispatch at the engine ceiling
+              # (max_num_seqs 256) without consulting Prometheus.
+              gateType: local-max-concurrency
+              gateParams:
+                limit: "256"
+              workerPoolID: default-workers
+        workerPools:
+          - name: default-workers
+            workers: 4
+            gateType: local-max-concurrency
+            # 4 workers x 64 = 256, aligned with the queue gate limit.
+            gateParams:
+              limit: "64"

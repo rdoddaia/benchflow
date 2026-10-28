@@ -13,6 +13,7 @@ from ..rhoai_mooncake import (
     mooncake_nvme_release_directory,
     rhoai_mooncake_spec,
 )
+from ..rhoai_batch import cleanup_rhoai_batch_gateway
 from ..rhoai_gateway import RHOAI_GATEWAY_NAMESPACE, rhoai_release_gateway_name
 from ..ui import detail
 
@@ -295,6 +296,9 @@ def cleanup_rhoai(
         _delete_profiler_configmap(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         _delete_runtime_pvcs(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         _delete_release_gateway(plan, kubectl_cmd=kubectl_cmd)
+        cleanup_rhoai_batch_gateway(
+            plan, kubectl_cmd=kubectl_cmd, timeout_seconds=timeout_seconds
+        )
         _delete_mooncake_resources(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         if skip_if_not_exists:
             return
@@ -321,6 +325,9 @@ def cleanup_rhoai(
         _delete_profiler_configmap(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         _delete_runtime_pvcs(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         _delete_release_gateway(plan, kubectl_cmd=kubectl_cmd)
+        cleanup_rhoai_batch_gateway(
+            plan, kubectl_cmd=kubectl_cmd, timeout_seconds=timeout_seconds
+        )
         _delete_mooncake_resources(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
         return
 
@@ -346,6 +353,9 @@ def cleanup_rhoai(
             )
             _delete_runtime_pvcs(plan, kubectl_cmd=kubectl_cmd, namespace=namespace)
             _delete_release_gateway(plan, kubectl_cmd=kubectl_cmd)
+            cleanup_rhoai_batch_gateway(
+                plan, kubectl_cmd=kubectl_cmd, timeout_seconds=timeout_seconds
+            )
             _delete_mooncake_resources(
                 plan, kubectl_cmd=kubectl_cmd, namespace=namespace
             )

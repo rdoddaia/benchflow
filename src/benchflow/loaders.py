@@ -55,6 +55,7 @@ from .models import (
     parse_metadata,
     parse_model_spec,
 )
+from .rhoai_batch import parse_batch_gateway_options
 
 _AIPERF_REQUIRED_FIELDS = {"endpoint_type"}
 _AIPERF_RESERVED_FIELDS = {"dataset_url", "dataset_name", "dataset_cap", "max_seconds"}
@@ -1295,6 +1296,13 @@ def load_deployment_profile(path: Path) -> DeploymentProfile:
         raise ValidationError(f"{path} is missing spec.mode")
     if profile_spec.platform == "rhaiis" and profile_spec.mode == "raw-vllm":
         profile_spec.options = _rhaiis_raw_vllm_options_from_dict(spec.get("options"))
+    if "batch_gateway" in profile_spec.options:
+        if profile_spec.platform != "rhoai" or profile_spec.mode == "isvc":
+            raise ValidationError(
+                f"{path}: options.batch_gateway is supported only for rhoai "
+                "distributed-default deployment profiles"
+            )
+        parse_batch_gateway_options(profile_spec.options["batch_gateway"])
 
     return DeploymentProfile(
         api_version=str(raw.get("apiVersion", "benchflow.io/v1alpha1")),

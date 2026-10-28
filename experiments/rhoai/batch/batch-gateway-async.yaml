@@ -1,0 +1,27 @@
+# Deploys Qwen3-32B on TP8 with the operator-managed RHOAI batch gateway in
+# async dispatch mode (Redis queues, local-max-concurrency gates, no
+# Prometheus dependency). BenchFlow deploys the stack and prints the
+# /v1/batches endpoint; drive the batch API with an external client
+# authenticated by a Kubernetes service-account token (see
+# docs/RHOAI_BATCH_GATEWAY.md).
+apiVersion: benchflow.io/v1alpha1
+kind: Experiment
+metadata:
+  name: batch-gateway-async
+spec:
+  model:
+    name:
+      - Qwen/Qwen3-32B
+  deployment_profile: batch-gateway-async
+  benchmark_profile: guidellm-smoke
+  metrics_profile: detailed
+  namespace: benchflow
+  stages:
+    # BenchFlow does not drive the /v1/batches API itself yet.
+    benchmark: false
+  mlflow:
+    tags:
+      accelerator: H100
+      topology: tp8
+  execution:
+    timeout: 4h

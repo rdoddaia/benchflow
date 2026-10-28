@@ -17,6 +17,7 @@ from ..rhoai_mooncake import (
     render_rhoai_mooncake_manifests,
     rhoai_mooncake_spec,
 )
+from ..rhoai_batch import deploy_rhoai_batch_gateway, rhoai_batch_gateway_requested
 from ..rhoai_gateway import (
     load_rhoai_gateway_configuration,
     render_rhoai_release_gateway,
@@ -442,6 +443,13 @@ def deploy_rhoai(
                 "than silently bypassing EndpointPicker routing."
             )
         success(f"Skipping deploy; {resource_kind} {release_name} already exists")
+        if rhoai_batch_gateway_requested(plan):
+            deploy_rhoai_batch_gateway(
+                plan,
+                kubectl_cmd=kubectl_cmd,
+                manifests_dir=manifests_dir,
+                timeout_seconds=verify_timeout_seconds,
+            )
         return manifests_dir.resolve() if manifests_dir else Path.cwd()
 
     if resource_kind == "LLMInferenceService":
@@ -537,5 +545,13 @@ def deploy_rhoai(
 
     if verify:
         _verify_deployment(plan, verify_timeout_seconds)
+
+    if rhoai_batch_gateway_requested(plan):
+        deploy_rhoai_batch_gateway(
+            plan,
+            kubectl_cmd=kubectl_cmd,
+            manifests_dir=manifests_dir,
+            timeout_seconds=verify_timeout_seconds,
+        )
 
     return manifests_dir.resolve() if manifests_dir else Path.cwd()

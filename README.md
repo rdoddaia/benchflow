@@ -81,10 +81,11 @@ bflow watch <execution-name> --namespace benchflow
 
 BenchFlow also supports matrix experiments by turning one or more profile fields into lists; the cluster then runs the cartesian product through child executions. `rhoai` and `llm-d` child executions can be admitted in parallel when target-cluster GPU capacity allows it. After all child executions finish, the parent prints a compact MLflow run summary. Once the parent has submitted child executions, canceling the parent is only best-effort; already queued or running children may need individual cancellation.
 
-For the full command surface, RunPlan PipelineRun flow, matrix execution, and lower-level runtime commands, see [docs/ADVANCED.md](docs/ADVANCED.md).
+For the full command surface, RunPlan PipelineRun flow, matrix execution, and lower-level runtime commands, see [docs/ADVANCED.md](docs/ADVANCED.md). For the operator-managed RHOAI batch gateway (`/v1/batches`) deployment path, see [docs/RHOAI_BATCH_GATEWAY.md](docs/RHOAI_BATCH_GATEWAY.md).
 
 ## Known Limitations
 
+- The RHOAI batch gateway path deploys the operator-managed `/v1/batches` stack and prints its endpoint, but BenchFlow does not drive the batch API itself; use an external batch client with a service-account token (see [docs/RHOAI_BATCH_GATEWAY.md](docs/RHOAI_BATCH_GATEWAY.md)).
 - The current AIPerf support is intentionally narrow: the explicit `aiperf-mooncake-trace`, `aiperf-mooncake-toolagent-trace`, and `aiperf-weka-trace` benchmark profiles for existing chat-style endpoints. It is not generic AIPerf support.
 - Comparison reports do not mix benchmark tools. `bflow benchmark plot comparison` can compare multiple GuideLLM runs or multiple AIPerf runs, but not both in one report. Inference Perf comparison reports are not supported yet; its rendered configuration, lifecycle reports, and logs are uploaded to MLflow.
 - Legacy target clusters without BenchFlow platform state are adopted heuristically; the first mutating run after upgrading BenchFlow may reset and reinstall shared `llm-d` or `RHOAI` prerequisites.

@@ -18,6 +18,7 @@ from ..platform_state import (
 )
 from ..setup import (
     discover_rhoai_mlflow_version,
+    ensure_rhoai_batch_gateway,
     llmd_platform_present,
     load_setup_state,
     normalize_rhoai_platform_version,
@@ -211,6 +212,20 @@ def setup_platform(
                         installed_setup_state,
                         workspace_dir=workspace_dir,
                     )
+                    if plan.deployment.platform == "rhoai":
+                        state_before_batch = dict(installed_setup_state)
+                        installed_setup_state = ensure_rhoai_batch_gateway(
+                            plan, kubectl_cmd, installed_setup_state
+                        )
+                        if installed_setup_state != state_before_batch:
+                            persist_cluster_platform_state(
+                                kubectl_cmd,
+                                plan.deployment.namespace,
+                                {
+                                    "installed_key": installed_key,
+                                    "setup_state": installed_setup_state,
+                                },
+                            )
                     detail(
                         f"Platform prerequisites already match setup key {requested_key}"
                     )

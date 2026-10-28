@@ -17,6 +17,7 @@ from ..cluster import (
     use_kubeconfig,
 )
 from ..models import ResolvedRunPlan
+from ..rhoai_batch import LLMBATCHGATEWAY_CRD_CANDIDATES, rhoai_batch_gateway_requested
 from ..ui import detail, step, success
 
 RHOAI_OPERATOR_NAMESPACE = "redhat-ods-operator"
@@ -50,6 +51,8 @@ def _empty_state(platform_version: str) -> dict[str, Any]:
         "datasciencecluster_managed": False,
         "gatewayclass_managed": False,
         "gateway_managed": False,
+        "batch_gateway_enabled": False,
+        "batch_gateway_preexisting": False,
     }
 
 
@@ -809,6 +812,89 @@ def _wait_for_gateway_ready(
     )
 
 
+def _dsc_batch_gateway_managed(kubectl_cmd: str) -> bool:
+    """True when the DSC already runs the batch gateway operator."""
+    result = run_command(
+        [
+            kubectl_cmd,
+            "get",
+            "datasciencecluster",
+            RHOAI_DSC_NAME,
+            "-o",
+            (
+                "jsonpath={.spec.components.aigateway.managementState}"
+                "/{.spec.components.aigateway.batchGateway.managementState}"
+            ),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    return str(result.stdout or "").strip() == "Managed/Managed"
+
+
+def _wait_for_llmbatchgateway_crd(kubectl_cmd: str) -> None:
+    step("Waiting for the LLMBatchGateway CRD")
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        for crd_name in LLMBATCHGATEWAY_CRD_CANDIDATES:
+            if _resource_exists([kubectl_cmd, "get", "crd", crd_name, "-o", "name"]):
+                return
+        time.sleep(10)
+    raise CommandError(
+        "timed out waiting for the LLMBatchGateway CRD; expected one of: "
+        + ", ".join(LLMBATCHGATEWAY_CRD_CANDIDATES)
+    )
+
+
+def ensure_rhoai_batch_gateway(
+    plan: ResolvedRunPlan, kubectl_cmd: str, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Enable the DSC batchGateway component when the release needs it.
+
+    The component is deliberately not part of the setup key: enabling it is
+    additive and idempotent, so batch and non-batch releases can share one
+    installed platform. BenchFlow only ever disables the component during
+    teardown when it enabled it itself on a DataScienceCluster it did not
+    create.
+    """
+    if plan.deployment.platform != "rhoai" or not rhoai_batch_gateway_requested(plan):
+        return state
+    if state.get("batch_gateway_enabled") or state.get("batch_gateway_preexisting"):
+        return state
+
+    if _dsc_batch_gateway_managed(kubectl_cmd):
+        detail("DataScienceCluster batchGateway component already Managed")
+        state["batch_gateway_preexisting"] = True
+    else:
+        step("Enabling the DataScienceCluster batchGateway component")
+        run_command(
+            [
+                kubectl_cmd,
+                "patch",
+                "datasciencecluster",
+                RHOAI_DSC_NAME,
+                "--type=merge",
+                "-p",
+                json.dumps(
+                    {
+                        "spec": {
+                            "components": {
+                                "aigateway": {
+                                    "managementState": "Managed",
+                                    "batchGateway": {"managementState": "Managed"},
+                                }
+                            }
+                        }
+                    }
+                ),
+            ]
+        )
+        state["batch_gateway_enabled"] = True
+        state["batch_gateway_preexisting"] = False
+    _wait_for_llmbatchgateway_crd(kubectl_cmd)
+    return state
+
+
 def setup_rhoai(
     plan: ResolvedRunPlan, *, state_path: Path | None = None
 ) -> dict[str, Any]:
@@ -935,6 +1021,9 @@ def setup_rhoai(
         label="kserve-controller-manager pods",
     )
 
+    ensure_rhoai_batch_gateway(plan, kubectl_cmd, state)
+    _persist_state(state, state_path)
+
     gatewayclass_documents = render_yaml_documents("setup/rhoai/gatewayclass.yaml", {})
     gatewayclass_document = gatewayclass_documents[0]
     if _gatewayclass_exists(kubectl_cmd):
@@ -1009,6 +1098,36 @@ def teardown_rhoai(plan: ResolvedRunPlan | None, state: dict[str, Any]) -> None:
                 RHOAI_GATEWAYCLASS_NAME,
                 "--ignore-not-found=true",
             ]
+        )
+
+    if (
+        state.get("batch_gateway_enabled")
+        and not state.get("datasciencecluster_managed")
+        and not state.get("batch_gateway_preexisting")
+    ):
+        step("Disabling the DataScienceCluster batchGateway component")
+        run_command(
+            [
+                kubectl_cmd,
+                "patch",
+                "datasciencecluster",
+                RHOAI_DSC_NAME,
+                "--type=merge",
+                "-p",
+                json.dumps(
+                    {
+                        "spec": {
+                            "components": {
+                                "aigateway": {
+                                    "managementState": "Removed",
+                                    "batchGateway": {"managementState": "Removed"},
+                                }
+                            }
+                        }
+                    }
+                ),
+            ],
+            check=False,
         )
 
     if state.get("datasciencecluster_managed"):

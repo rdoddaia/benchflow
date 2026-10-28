@@ -8,6 +8,7 @@ from .llmd import (
 )
 from .rhoai import (
     discover_rhoai_mlflow_version,
+    ensure_rhoai_batch_gateway,
     normalize_rhoai_platform_version,
     reset_rhoai_platform,
     rhoai_platform_present,
@@ -17,6 +18,7 @@ from .rhoai import (
 
 __all__ = [
     "discover_rhoai_mlflow_version",
+    "ensure_rhoai_batch_gateway",
     "llmd_platform_present",
     "load_setup_state",
     "normalize_rhoai_platform_version",
