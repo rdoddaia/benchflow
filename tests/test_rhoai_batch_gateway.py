@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from benchflow.cluster import CommandError
 from benchflow.loaders import ProfileCatalog, load_deployment_profile, load_experiment
 from benchflow.matrix import resolve_experiment_matrix
 from benchflow.models import ValidationError
@@ -529,6 +530,60 @@ def test_parse_batch_gateway_options_rejects_bad_internal_route_auth() -> None:
         parse_batch_gateway_options(options)
 
 
+def _fake_crd(group: str) -> dict:
+    return {
+        "spec": {
+            "versions": [
+                {"name": "v1alpha1", "served": True},
+                {"name": "v1alpha2", "served": True},
+            ]
+        }
+    }
+
+
+def test_community_objective_api_version_prefers_llm_d_ai(monkeypatch) -> None:
+    """Both CRD groups installed: the community discovery must mirror the
+    llm-d-router EPP, which prefers llm-d.ai and ignores legacy resources."""
+    from benchflow import rhoai_batch
+
+    def fake_crd_json(kubectl_cmd: str, crd_name: str):
+        return _fake_crd(crd_name)
+
+    monkeypatch.setattr(rhoai_batch, "_crd_json", fake_crd_json)
+    assert (
+        rhoai_batch.community_inference_objective_api_version("oc")
+        == "llm-d.ai/v1alpha2"
+    )
+    # The operator-order discovery still resolves the legacy group first.
+    assert (
+        rhoai_batch.inference_objective_api_version("oc")
+        == "inference.networking.x-k8s.io/v1alpha2"
+    )
+
+
+def test_community_objective_api_version_falls_back_to_legacy(monkeypatch) -> None:
+    from benchflow import rhoai_batch
+
+    def fake_crd_json(kubectl_cmd: str, crd_name: str):
+        if crd_name.startswith("inferenceobjectives.llm-d.ai"):
+            return None
+        return _fake_crd(crd_name)
+
+    monkeypatch.setattr(rhoai_batch, "_crd_json", fake_crd_json)
+    assert (
+        rhoai_batch.community_inference_objective_api_version("oc")
+        == "inference.networking.x-k8s.io/v1alpha2"
+    )
+
+
+def test_community_objective_api_version_requires_a_crd(monkeypatch) -> None:
+    from benchflow import rhoai_batch
+
+    monkeypatch.setattr(rhoai_batch, "_crd_json", lambda *a: None)
+    with pytest.raises(CommandError, match="InferenceObjective"):
+        rhoai_batch.community_inference_objective_api_version("oc")
+
+
 def test_community_spec_uses_configured_objectives() -> None:
     plan = _plans("batch-gateway-async-sql")[0]
     spec = rhoai_batch_gateway_spec(plan)
@@ -717,6 +772,10 @@ def _deploy_mocks(monkeypatch, plan, *, applied: list, written: list):
     )
     monkeypatch.setattr(
         f"{module}.inference_objective_api_version",
+        lambda kubectl_cmd: "inference.networking.x-k8s.io/v1alpha2",
+    )
+    monkeypatch.setattr(
+        f"{module}.community_inference_objective_api_version",
         lambda kubectl_cmd: "llm-d.ai/v1alpha2",
     )
     monkeypatch.setattr(

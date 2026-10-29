@@ -30,6 +30,13 @@ INFERENCE_OBJECTIVE_CRD_CANDIDATES = (
     "inferenceobjectives.inference.networking.x-k8s.io",
     "inferenceobjectives.llm-d.ai",
 )
+# llm-d-router EPP discovery order (pkg/epp/server/controller_config.go):
+# when both CRDs are installed the EPP prefers llm-d.ai and IGNORES legacy
+# resources, so community deployments must create objectives there.
+COMMUNITY_INFERENCE_OBJECTIVE_CRD_CANDIDATES = (
+    "inferenceobjectives.llm-d.ai",
+    "inferenceobjectives.inference.networking.x-k8s.io",
+)
 INFERENCE_OBJECTIVE_PREFERRED_VERSION = "v1alpha2"
 INFERENCE_POOL_CRD_CANDIDATES = (
     "inferencepools.inference.networking.k8s.io",
@@ -576,6 +583,23 @@ def inference_objective_api_version(kubectl_cmd: str) -> str:
     return _crd_api_version(
         kubectl_cmd,
         INFERENCE_OBJECTIVE_CRD_CANDIDATES,
+        INFERENCE_OBJECTIVE_PREFERRED_VERSION,
+        label="InferenceObjective",
+    )
+
+
+def community_inference_objective_api_version(kubectl_cmd: str) -> str:
+    """Mirror the llm-d-router EPP CRD discovery order: prefer llm-d.ai.
+
+    The community llm-d-router EPP resolves request objectives from the
+    llm-d.ai InferenceObjective CRD when both it and the legacy
+    inference.networking.x-k8s.io CRD are installed (it logs "EPP will
+    prefer the new group and IGNORE legacy resources"). BenchFlow must
+    create the objectives in the group the running EPP actually watches.
+    """
+    return _crd_api_version(
+        kubectl_cmd,
+        COMMUNITY_INFERENCE_OBJECTIVE_CRD_CANDIDATES,
         INFERENCE_OBJECTIVE_PREFERRED_VERSION,
         label="InferenceObjective",
     )
@@ -2253,10 +2277,15 @@ def deploy_rhoai_batch_gateway(
     )
     if spec.community_implementation:
         api_version = ""
+        # The community llm-d-router EPP prefers the llm-d.ai InferenceObjective
+        # CRD when both groups are installed; mirror its discovery order.
+        objective_api_version = community_inference_objective_api_version(kubectl_cmd)
+        detail("LLMBatchGateway API: (community components)")
     else:
         api_version = llmbatchgateway_api_version(kubectl_cmd)
+        objective_api_version = inference_objective_api_version(kubectl_cmd)
         detail(f"LLMBatchGateway API: {api_version}")
-    objective_api_version = inference_objective_api_version(kubectl_cmd)
+    detail(f"InferenceObjective API: {objective_api_version}")
     pool_group = inference_pool_group(kubectl_cmd)
 
     step("Preparing the batch internal Gateway")
@@ -2458,7 +2487,12 @@ def cleanup_rhoai_batch_gateway(
 
     for resources, resource_namespace in (
         ("httproute", namespace),
-        ("inferenceobjective", namespace),
+        # Both InferenceObjective CRD groups are cleaned explicitly: the bare
+        # resource name resolves to whichever CRD oc picks first, and the
+        # community EPP path creates objectives under llm-d.ai while the
+        # operator path may use the legacy inference.networking.x-k8s.io group.
+        ("inferenceobjectives.llm-d.ai", namespace),
+        ("inferenceobjectives.inference.networking.x-k8s.io", namespace),
         ("authpolicy", namespace),
         ("deployment", namespace),
         ("statefulset", namespace),

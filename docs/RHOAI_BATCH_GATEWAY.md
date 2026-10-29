@@ -180,7 +180,15 @@ eviction. Constraints and behaviors:
   InferenceObjective so header-tagged interactive traffic keeps its protected
   band. The community processor stamps `x-gateway-inference-objective` on
   dispatched requests itself, and EPP v0.10.0 accepts both that name and the
-  `x-llm-d-inference-objective` alias the legacy drivers send.
+  `x-llm-d-inference-objective` alias the legacy drivers send. **Objective
+  CRD group:** when both the `llm-d.ai` and legacy
+  `inference.networking.x-k8s.io` InferenceObjective CRDs are installed, the
+  community llm-d-router EPP prefers `llm-d.ai` and IGNORES legacy resources
+  (it logs a warning at startup). BenchFlow mirrors that discovery order for
+  the community path (`community_inference_objective_api_version`), so the
+  objectives are created in the group the running EPP actually watches.
+  Creating them in the ignored group fails silently: every request falls
+  back to defaultPriority 0 and there is no batch/interactive separation.
 - **`internal_route_auth: false`** skips the llm-route AuthPolicy for
   driver parity with the legacy unauthenticated internal path.
 
