@@ -117,7 +117,7 @@ spec:
       images:
         apiserver: ghcr.io/llm-d/batch-gateway-apiserver@sha256:3ab83764c564054dfa0df98de4e3c733b8c7ecd5beea411063c3565450f5f6b4
         processor: ghcr.io/llm-d/batch-gateway-processor@sha256:df2c1b920b8f1fc6186947166a6e31ae1e0dea9d2a832334d455fcee3889e5b0
-        gc: ghcr.io/llm-d/batch-gateway-gc@sha256:08e5844c30c26f68ac91170e4565fef003c36cfa031baaaaee605d1b4614cc5be
+        gc: ghcr.io/llm-d/batch-gateway-gc@sha256:08e5844c30c26f68ac91170e4565fef003c36cfa031baaaaee60d1b4614cc5be
         async: ghcr.io/llm-d/llm-d-async@sha256:9964c2ff0f302d106825e2d92f06f6bbd424ce25a80482eb315d4e87547f8f9d
       # Objective names match the legacy stack (and the cybergym driver
       # defaults): batch requests ride priority -1, interactive priority 0.
