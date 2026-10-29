@@ -29,6 +29,12 @@ Two deployment profiles exercise the two dispatch modes:
   them (`asyncConfig`). The profile uses `local-max-concurrency` gates only, so
   it needs no Prometheus. Set the queue `gateType` to `prometheus-budget` and
   add `prometheusURL` for flow-control-based dispatch.
+- `profiles/deployment/rhoai/batch/batch-gateway-async-sql.yaml` — the
+  community implementation over the PostgreSQL SQL queue transport (see
+  "Community implementation and the SQL transport" below): BenchFlow renders
+  the llm-d components directly, the EPP runs the SCR flow-control policy with
+  in-flight eviction, and the runtime serves the YaRN-scaled Qwen3-32B copy at
+  131072 context with report-era vLLM v0.26.0 flags.
 
 Both pin `RHOAI-3.5.0` / channel `stable-3.5` — the stable line the upstream
 deploy-rhoai.md recipe targets, whose operator already ships the batch-gateway
@@ -55,6 +61,12 @@ They disable the benchmark stage because the batch drivers are external.
    `redis-url` and `postgresql-url` keys. The backing Redis and PostgreSQL can
    live in any namespace the URLs reach. BenchFlow fails fast with a pointer to
    this document when the Secret is missing; it never creates it for you.
+   The SQL transport needs only the `postgresql-url` key (a dedicated database
+   on the shared PostgreSQL instance works — the transport creates its
+   `async_*` tables on startup); the community Redis transport needs both keys.
+   When `internal_route_auth: false` disables the llm-route AuthPolicy,
+   clients reach the inference path without a Kubernetes token (legacy-stack
+   driver parity; the external `/v1/batches` route keeps its own policy).
 3. **Optional: Kuadrant.** When the Kuadrant APIs are absent, BenchFlow skips
    the batch AuthPolicies and the gateway runs without gateway-level
    authentication. The guide's TokenRateLimitPolicy is deliberately not
@@ -127,6 +139,63 @@ a first-party batch benchmark it will live in
 `src/benchflow/benchmark/batch_gateway.py`; until then that module raises
 `NotImplementedError` on purpose.
 
+## Community implementation and the SQL transport
+
+`options.batch_gateway.implementation: community` replaces the
+LLMBatchGateway CR with BenchFlow-rendered community components
+(`llm-d/llm-d-batch-gateway` apiserver/processor/gc plus the `llm-d-async`
+dispatcher), mirroring the upstream `charts/batch-gateway` templates. It exists
+because the RHOAI 3.5 CRD cannot express the SQL queue transport or in-flight
+eviction. Constraints and behaviors:
+
+- **Async dispatch only.** Sync dispatch stays on the operator path; the
+  community path rejects `dispatch_mode: sync`.
+- **Images are pinned by the profile.** `options.batch_gateway.images` maps
+  `apiserver`, `processor`, `gc`, and `async` to digest-pinned references and
+  is required. The SQL transport is main-branch only: its queue schema couples
+  the processor (producer) and llm-d-async (consumer), so pin same-day
+  digests.
+- **`async_config` is derived.** The community renderer builds the whole
+  processor `async_dispatch` block and the llm-d-async
+  `--transport-config` from the release (model, pool, objective, queue names
+  `llm-d-async:requests|results:<pool>`); a profile-supplied `async_config`
+  is rejected.
+- **Naming and cleanup are operator-identical.** Components are named
+  `<release>-batch-gateway-{apiserver,processor,gc}` and
+  `<release>-llm-d-async` and carry the same benchflow release labels, so the
+  apiserver Service needs no discovery and `undeploy` deletes them with the
+  same selector. The processor is a StatefulSet with a headless Service
+  (chart shape); the gc watches pods through a small Role/RoleBinding.
+- **Connection URLs never render into manifests.** The processor reads its
+  database URL from the projected secret (`/etc/.secrets/postgresql-url`,
+  the hardcoded upstream convention); llm-d-async gets `SQL_URL` (sql) or
+  `REDIS_URL` (redis) via a `secretKeyRef`.
+- **`transport: sql`** requires `implementation: community`,
+  `dispatch_mode: async`, and `db_backend: postgresql` — the queues live in
+  the batch gateway database and llm-d-async creates its `async_*` tables
+  there on startup. Partitions (64 per queue) split evenly across processor
+  replicas; no Redis/Valkey is involved.
+- **Objectives.** The batch objective (`inference_objective`, priority -1) is
+  rendered as usual; `interactive_objective` additionally renders a priority-0
+  InferenceObjective so header-tagged interactive traffic keeps its protected
+  band. The community processor stamps `x-gateway-inference-objective` on
+  dispatched requests itself, and EPP v0.10.0 accepts both that name and the
+  `x-llm-d-inference-objective` alias the legacy drivers send.
+- **`internal_route_auth: false`** skips the llm-route AuthPolicy for
+  driver parity with the legacy unauthenticated internal path.
+
+The reference deployment is
+`profiles/deployment/rhoai/batch/batch-gateway-async-sql.yaml` +
+`experiments/rhoai/batch/batch-gateway-async-sql.yaml`, which pairs the
+community SQL stack with the community EPP (v0.10.0, digest-pinned via
+`spec.scheduler_image`) running the SCR policy (`enableEviction: true`, cap
+128, TTL 45s — requires `epp_allow_experimental_plugins: true` because SCR
+and eviction are Alpha) and the YaRN-scaled Qwen3-32B copy served at
+`--max-model-len=131072` from a hostPath models PV pinned to one node
+(`model_storage.model_subpath: Qwen-Qwen3-32B-yarn`; plain Qwen3-32B caps at
+40960, so the env `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` and the scaled copy are
+both required).
+
 ## Option reference
 
 `options.batch_gateway` (rhoai `distributed-default` profiles only):
@@ -137,6 +206,11 @@ a first-party batch benchmark it will live in
 | `db_backend` | `postgresql` | `postgresql` or `redis` |
 | `file_storage` | required | exactly one of `fs` (`claim_name`, `base_path`, `storage_class_name`) or `s3` (verbatim CR passthrough) |
 | `dispatch_mode` | `sync` | `sync` or `async` |
+| `implementation` | `operator` | `operator` (LLMBatchGateway CR) or `community` (rendered components; async only) |
+| `transport` | `redis-sortedset` | `redis-sortedset` or `sql` (sql requires community + async + `db_backend: postgresql`) |
+| `images` | — | community only; required; `apiserver`, `processor`, `gc`, `async` digest-pinned references |
+| `interactive_objective` | unset | optional; renders an additional priority-0 InferenceObjective with this name |
+| `internal_route_auth` | `true` | when false, skips the llm-route AuthPolicy (unauthenticated internal path) |
 | `api_server_replicas` | `1` | |
 | `processor_replicas` | `1` | |
 | `request_timeout` | `5m` | sync only |
@@ -150,4 +224,6 @@ a first-party batch benchmark it will live in
 
 BenchFlow injects release-derived `async_config` fields the profile cannot
 know when they are absent: each queue's `name`, `igwBaseURL`, and (for
-`prometheus-budget` gates) `gateParams.pool` and `gateParams.namespace`.
+`prometheus-budget` gates) `gateParams.pool` and `gateParams.namespace`. The
+community implementation derives the entire `async_config` instead — see
+"Community implementation and the SQL transport".
