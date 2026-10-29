@@ -1,0 +1,132 @@
+# Community batch gateway (llm-d images rendered by BenchFlow) with async
+# dispatch over the PostgreSQL SQL queue transport — the stack shape of the
+# legacy batch-bench "BGW + async processor" arm, rebuilt on the RHOAI 3.5
+# serving path (LLMInferenceService + InferencePool + Gateway API).
+#
+# The RHOAI 3.5 LLMBatchGateway CRD cannot express the SQL transport or
+# in-flight eviction, so BenchFlow renders the community components
+# (apiserver/processor/gc + llm-d-async) directly from digest-pinned images,
+# mirroring the upstream charts/batch-gateway templates. Component names
+# follow the operator convention (<release>-batch-gateway-*) so discovery and
+# cleanup behave identically.
+#
+# Serving parity with the legacy report: the YaRN-scaled Qwen3-32B copy
+# (max_position_embeddings 40960, rope_scaling yarn factor 4) served at
+# --max-model-len=131072 from the mt46x-local models PV, and the SCR EPP
+# policy with in-flight eviction at cap 128 / TTL 45s. Internal-route auth
+# is disabled for old-report parity: the cybergym drivers send no
+# Authorization header on the inference path.
+#
+# Requires the batch-gateway-sql-secrets Secret (postgresql-url only) in the
+# deployment namespace; see docs/RHOAI_BATCH_GATEWAY.md.
+apiVersion: benchflow.io/v1alpha1
+kind: DeploymentProfile
+metadata:
+  name: batch-gateway-async-sql
+spec:
+  platform: rhoai
+  mode: distributed-default
+  platform_version: RHOAI-3.5.0
+  platform_channel: stable-3.5
+  endpoint_path: /v1/models
+  scheduler_image: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:2e516fa1310da7be59b82beb1445362139597d6d553ef04d546716abe3aaaa70
+  model_storage:
+    # hostPath PV backed by the mt46x NVMe models directory; contains the
+    # YaRN-scaled copy the report served (plain Qwen3-32B caps at 40960).
+    pvc_name: benchflow-models-mt46x
+    cache_dir: ""
+    model_subpath: Qwen-Qwen3-32B-yarn
+  runtime:
+    # Report-era engine image; the ISVC controller adds TLS flags on top.
+    image: vllm/vllm-openai:v0.26.0
+    replicas: 1
+    tensor_parallelism: 8
+    env:
+      USER: benchflow
+      LOGNAME: benchflow
+      HOME: /tmp
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      CUDA_MODULE_LOADING: LAZY
+      # vLLM compares --max-model-len against the raw config value
+      # (40960); the YaRN-scaled effective context needs this escape hatch.
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+    vllm_args:
+      - --max-model-len=131072
+      - --max-num-seqs=256
+      - --gpu-memory-utilization=0.90
+      - --trust-remote-code
+      - --enable-prefix-caching
+      - --tool-call-parser=qwen3_xml
+      - --enable-auto-tool-choice
+  options:
+    enable_auth: false
+    # Community EPP v0.10.0: SCR is an Alpha plugin and in-flight eviction
+    # needs the flowControl feature gate; both require the escape flag.
+    epp_allow_experimental_plugins: true
+    # SCR policy from the report's bgwasync-slo-scr-r-evon arm: cap 128
+    # (the saturation reference), enableEviction true, TTL 45s.
+    epp_config: |
+      apiVersion: llm-d.ai/v1alpha1
+      kind: EndpointPickerConfig
+      featureGates:
+        - flowControl
+      plugins:
+        - type: queue-scorer
+        - type: prefix-cache-scorer
+        - type: round-robin-fairness-policy
+        - type: fcfs-ordering-policy
+        - type: concurrency-detector
+          parameters:
+            maxConcurrency: 128
+            concurrencyMode: requests
+            headroom: 0.0
+        - type: soft-reflective-ceiling-policy
+          name: scr-ceiling
+      schedulingProfiles:
+        - name: default
+          plugins:
+            - pluginRef: queue-scorer
+              weight: 2
+            - pluginRef: prefix-cache-scorer
+              weight: 3
+      flowControl:
+        saturationDetector:
+          pluginRef: concurrency-detector
+        enableEviction: true
+        usageLimitPolicyPluginRef: scr-ceiling
+        maxBytes: "1Gi"
+        maxRequests: "2000"
+        defaultRequestTTL: "45s"
+        priorityBands:
+          - priority: 0
+            maxRequests: "1500"
+            fairnessPolicyRef: round-robin-fairness-policy
+            orderingPolicyRef: fcfs-ordering-policy
+          - priority: -1
+            maxRequests: "2000"
+            fairnessPolicyRef: round-robin-fairness-policy
+            orderingPolicyRef: fcfs-ordering-policy
+    batch_gateway:
+      secret_name: batch-gateway-sql-secrets
+      db_backend: postgresql
+      dispatch_mode: async
+      implementation: community
+      transport: sql
+      # Digest-pinned community images (same-day schema coupling between the
+      # processor producer and the llm-d-async consumer of the SQL queues).
+      images:
+        apiserver: ghcr.io/llm-d/batch-gateway-apiserver@sha256:3ab83764c564054dfa0df98de4e3c733b8c7ecd5beea411063c3565450f5f6b4
+        processor: ghcr.io/llm-d/batch-gateway-processor@sha256:df2c1b920b8f1fc6186947166a6e31ae1e0dea9d2a832334d455fcee3889e5b0
+        gc: ghcr.io/llm-d/batch-gateway-gc@sha256:08e5844c30c26f68ac91170e4565fef003c36cfa031baaaaee605d1b4614cc5be
+        async: ghcr.io/llm-d/llm-d-async@sha256:9964c2ff0f302d106825e2d92f06f6bbd424ce25a80482eb315d4e87547f8f9d
+      # Objective names match the legacy stack (and the cybergym driver
+      # defaults): batch requests ride priority -1, interactive priority 0.
+      inference_objective: batch-low
+      interactive_objective: interactive-high
+      # Old-report parity: the drivers hit the internal gateway with no
+      # Authorization header, so the llm-route AuthPolicy must not apply.
+      internal_route_auth: false
+      file_storage:
+        fs:
+          base_path: /tmp/batch-gateway
+          storage_class_name: rook-cephfs-fast

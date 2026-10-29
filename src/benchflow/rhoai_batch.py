@@ -5,7 +5,7 @@ import json
 import re
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,11 @@ _BATCH_GATEWAY_OPTION_KEYS = {
     "api_server_replicas",
     "processor_replicas",
     "dispatch_mode",
+    "implementation",
+    "transport",
+    "images",
+    "interactive_objective",
+    "internal_route_auth",
     "request_timeout",
     "max_retries",
     "initial_backoff",
@@ -56,6 +61,9 @@ _BATCH_GATEWAY_OPTION_KEYS = {
     "gc_interval",
     "tls",
 }
+_COMMUNITY_IMAGE_KEYS = ("apiserver", "processor", "gc", "async")
+_BATCH_GATEWAY_IMPLEMENTATIONS = ("operator", "community")
+_BATCH_GATEWAY_TRANSPORTS = ("redis-sortedset", "sql")
 _SYNC_ONLY_OPTION_KEYS = (
     "request_timeout",
     "max_retries",
@@ -84,6 +92,15 @@ class BatchGatewaySpec:
     async_config: dict[str, Any]
     gc_interval: str
     tls: dict[str, Any]
+    implementation: str = "operator"
+    transport: str = "redis-sortedset"
+    images: dict[str, str] = field(default_factory=dict)
+    interactive_objective: str = ""
+    internal_route_auth: bool = True
+
+    @property
+    def community_implementation(self) -> bool:
+        return self.implementation == "community"
 
     @property
     def tls_enabled(self) -> bool:
@@ -189,8 +206,17 @@ def _parse_file_storage(raw: Any) -> dict[str, Any]:
     }
 
 
-def _parse_async_config(raw: Any, dispatch_mode: str) -> dict[str, Any]:
+def _parse_async_config(
+    raw: Any, dispatch_mode: str, *, derived: bool = False
+) -> dict[str, Any]:
     if dispatch_mode == "async":
+        if derived:
+            if raw:
+                raise ValidationError(
+                    "options.batch_gateway.async_config is derived by BenchFlow "
+                    "for implementation: community; remove it from the profile"
+                )
+            return {}
         if not isinstance(raw, dict) or not raw:
             raise ValidationError(
                 "options.batch_gateway.async_config is required for dispatch_mode: async"
@@ -201,6 +227,57 @@ def _parse_async_config(raw: Any, dispatch_mode: str) -> dict[str, Any]:
             "options.batch_gateway.async_config applies only to dispatch_mode: async"
         )
     return {}
+
+
+def _parse_implementation(raw: Any) -> str:
+    implementation = str(raw or "operator").strip()
+    if implementation not in _BATCH_GATEWAY_IMPLEMENTATIONS:
+        raise ValidationError(
+            "options.batch_gateway.implementation must be one of: "
+            + ", ".join(_BATCH_GATEWAY_IMPLEMENTATIONS)
+        )
+    return implementation
+
+
+def _parse_transport(raw: Any) -> str:
+    transport = str(raw or "redis-sortedset").strip()
+    if transport not in _BATCH_GATEWAY_TRANSPORTS:
+        raise ValidationError(
+            "options.batch_gateway.transport must be one of: "
+            + ", ".join(_BATCH_GATEWAY_TRANSPORTS)
+        )
+    return transport
+
+
+def _parse_images(raw: Any, implementation: str) -> dict[str, str]:
+    if implementation != "community":
+        if raw:
+            raise ValidationError(
+                "options.batch_gateway.images applies only to "
+                "implementation: community"
+            )
+        return {}
+    if not isinstance(raw, dict):
+        raise ValidationError(
+            "options.batch_gateway.images is required for implementation: "
+            "community and must be a mapping of component image references"
+        )
+    unknown = sorted(set(raw) - set(_COMMUNITY_IMAGE_KEYS))
+    if unknown:
+        raise ValidationError(
+            "options.batch_gateway.images contains unsupported fields: "
+            + ", ".join(unknown)
+        )
+    images: dict[str, str] = {}
+    for key in _COMMUNITY_IMAGE_KEYS:
+        value = str(raw.get(key) or "").strip()
+        if not value:
+            raise ValidationError(
+                f"options.batch_gateway.images.{key} is required for "
+                "implementation: community; pin a digest for reproducibility"
+            )
+        images[key] = value
+    return images
 
 
 def _parse_tls(raw: Any) -> dict[str, Any]:
@@ -241,6 +318,39 @@ def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
         raise ValidationError(
             "options.batch_gateway.dispatch_mode must be 'sync' or 'async'"
         )
+    implementation = _parse_implementation(raw.get("implementation"))
+    transport = _parse_transport(raw.get("transport"))
+    if transport == "sql":
+        if implementation != "community":
+            raise ValidationError(
+                "options.batch_gateway.transport: sql requires implementation: "
+                "community — the RHOAI 3.5 LLMBatchGateway CRD cannot express the "
+                "SQL queue transport"
+            )
+        if dispatch_mode != "async":
+            raise ValidationError(
+                "options.batch_gateway.transport: sql requires dispatch_mode: async"
+            )
+        if db_backend != "postgresql":
+            raise ValidationError(
+                "options.batch_gateway.transport: sql requires db_backend: "
+                "postgresql — the SQL queues live in the batch gateway database"
+            )
+    if implementation == "community" and dispatch_mode != "async":
+        raise ValidationError(
+            "options.batch_gateway.implementation: community supports "
+            "dispatch_mode: async only; sync dispatch is covered by the "
+            "operator path"
+        )
+    images = _parse_images(raw.get("images"), implementation)
+    interactive_objective = str(raw.get("interactive_objective") or "").strip()
+    internal_route_auth = raw.get("internal_route_auth")
+    if internal_route_auth is None:
+        internal_route_auth = True
+    if not isinstance(internal_route_auth, bool):
+        raise ValidationError(
+            "options.batch_gateway.internal_route_auth must be a boolean"
+        )
 
     sync_only_set = [key for key in _SYNC_ONLY_OPTION_KEYS if raw.get(key) is not None]
     if dispatch_mode == "async" and sync_only_set:
@@ -251,7 +361,9 @@ def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
         )
 
     file_storage = _parse_file_storage(raw.get("file_storage"))
-    async_config = _parse_async_config(raw.get("async_config"), dispatch_mode)
+    async_config = _parse_async_config(
+        raw.get("async_config"), dispatch_mode, derived=implementation == "community"
+    )
     tls = _parse_tls(raw.get("tls"))
 
     gc_interval = raw.get("gc_interval")
@@ -295,6 +407,11 @@ def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
         "async_config": async_config,
         "gc_interval": gc_interval,
         "tls": tls,
+        "implementation": implementation,
+        "transport": transport,
+        "images": images,
+        "interactive_objective": interactive_objective,
+        "internal_route_auth": internal_route_auth,
     }
 
 
@@ -339,6 +456,11 @@ def rhoai_batch_gateway_spec(plan: ResolvedRunPlan) -> BatchGatewaySpec | None:
         async_config=parsed["async_config"],
         gc_interval=parsed["gc_interval"],
         tls=parsed["tls"],
+        implementation=parsed["implementation"],
+        transport=parsed["transport"],
+        images=parsed["images"],
+        interactive_objective=parsed["interactive_objective"],
+        internal_route_auth=parsed["internal_route_auth"],
     )
 
 
@@ -717,18 +839,25 @@ def render_batch_inference_objective_manifest(
     api_version: str,
     pool_group: str,
     pool_name: str,
+    name: str | None = None,
+    priority: int = -1,
+    component: str = "batch-inference-objective",
 ) -> dict[str, Any]:
-    """Sheddable objective (priority -1) the batch processor requests."""
+    """Objective CR the EPP resolves to a priority band.
+
+    The batch objective defaults to priority -1 (sheddable). Callers that
+    render an interactive objective pass name/priority/component explicitly.
+    """
     return {
         "apiVersion": api_version,
         "kind": "InferenceObjective",
         "metadata": {
-            "name": spec.inference_objective,
+            "name": name or spec.inference_objective,
             "namespace": plan.deployment.namespace,
-            "labels": _batch_labels(plan, "batch-inference-objective"),
+            "labels": _batch_labels(plan, component),
         },
         "spec": {
-            "priority": -1,
+            "priority": priority,
             "poolRef": {"group": pool_group, "name": pool_name},
         },
     }
@@ -947,6 +1076,875 @@ def render_llmbatchgateway_manifest(
     return manifest
 
 
+# ---------------------------------------------------------------------------
+# Community batch gateway rendering (llm-d/llm-d-batch-gateway images)
+#
+# The RHOAI 3.5 LLMBatchGateway CRD cannot express the SQL queue transport or
+# in-flight eviction, so BenchFlow renders the community components directly,
+# mirroring the upstream charts/batch-gateway templates (main branch) as
+# Python dicts. Component names reuse the operator convention
+# (<release>-batch-gateway-<component>) so service discovery and cleanup work
+# identically on both paths.
+
+
+def community_component_name(plan: ResolvedRunPlan, component: str) -> str:
+    return _scoped_name(plan.deployment.release_name, f"batch-gateway-{component}")
+
+
+def llm_d_async_name(plan: ResolvedRunPlan) -> str:
+    return _scoped_name(plan.deployment.release_name, "llm-d-async")
+
+
+def _community_labels(plan: ResolvedRunPlan, component: str) -> dict[str, str]:
+    return {
+        **_batch_labels(plan, component),
+        "app.kubernetes.io/instance": plan.deployment.release_name,
+    }
+
+
+def _community_selector(plan: ResolvedRunPlan, component: str) -> dict[str, str]:
+    return {
+        "app.kubernetes.io/name": "benchflow",
+        "app.kubernetes.io/component": component,
+        "benchflow.io/release": plan.deployment.release_name,
+    }
+
+
+def _community_selector_flat(plan: ResolvedRunPlan, component: str) -> str:
+    return ",".join(
+        f"{key}={value}"
+        for key, value in sorted(_community_selector(plan, component).items())
+    )
+
+
+def _community_pod_security_context() -> dict[str, Any]:
+    return {
+        "runAsNonRoot": True,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+
+
+def _community_container_security_context() -> dict[str, Any]:
+    return {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
+
+_COMMUNITY_FILES_BASE_PATH = "/tmp/batch-gateway"
+_COMMUNITY_PROCESSOR_WORK_DIR = "/var/lib/batch-gateway/processor"
+_COMMUNITY_PROCESSOR_WORK_DIR_SIZE = "10Gi"
+
+
+def _community_file_client(spec: BatchGatewaySpec) -> dict[str, Any]:
+    s3 = deepcopy(spec.file_storage.get("s3") or {})
+    return {
+        "type": "fs" if spec.uses_fs_storage else "s3",
+        "fs": {"base_path": spec.fs_base_path or _COMMUNITY_FILES_BASE_PATH},
+        "s3": {
+            "region": str(s3.get("region") or ""),
+            "bucket": str(s3.get("bucket") or ""),
+            "endpoint": str(s3.get("endpoint") or ""),
+            "access_key_id": str(s3.get("access_key_id") or ""),
+            "prefix": str(s3.get("prefix") or ""),
+            "use_path_style": bool(s3.get("use_path_style") or False),
+            "auto_create_bucket": bool(s3.get("auto_create_bucket", True)),
+        },
+        "retry": {
+            "max_retries": 3,
+            "initial_backoff": "1s",
+            "max_backoff": "10s",
+        },
+    }
+
+
+def _community_apiserver_config(spec: BatchGatewaySpec) -> dict[str, Any]:
+    return {
+        "host": "",
+        "port": "8000",
+        "observability_port": "8081",
+        "input_headers": {"tenant": "X-MaaS-Username"},
+        "read_header_timeout_seconds": 10,
+        "read_timeout_seconds": 900,
+        "write_timeout_seconds": 120,
+        "idle_timeout_seconds": 90,
+        "api_shutdown_timeout_seconds": 60,
+        "observability_shutdown_timeout_seconds": 60,
+        "db_client": {"type": spec.db_backend},
+        "file_client": _community_file_client(spec),
+        "batch_api": {
+            "batch_event_ttl_seconds": 2592000,
+            "pass_through_headers": ["Authorization"],
+        },
+        "file_api": {
+            "default_expiration_seconds": 7776000,
+            "max_size_bytes": 209715200,
+            "max_line_count": 50000,
+        },
+        "enable_pprof": False,
+        "otel": {"postgresql_tracing": False},
+    }
+
+
+def _community_processor_config(
+    plan: ResolvedRunPlan,
+    spec: BatchGatewaySpec,
+    *,
+    pool_name: str,
+) -> dict[str, Any]:
+    request_queue = f"llm-d-async:requests:{pool_name}"
+    result_queue = f"llm-d-async:results:{pool_name}"
+    async_dispatch: dict[str, Any] = {
+        "transport": spec.transport,
+        "result_poll_timeout": "30s",
+        "poll_interval": "1s",
+        "models": {
+            plan.model.name: {
+                "inference_pool_name": pool_name,
+                "inference_objective": spec.inference_objective,
+                "request_queue_name": request_queue,
+                "result_queue_name": result_queue,
+            }
+        },
+    }
+    if spec.transport == "sql":
+        async_dispatch["max_connections"] = 8
+    return {
+        "addr": ":9090",
+        "task_wait_time": "1s",
+        "poll_interval": "5s",
+        "num_workers": 5,
+        "work_dir_size_limit": _COMMUNITY_PROCESSOR_WORK_DIR_SIZE,
+        "input_file_disk_budget_percent": 10,
+        "input_file_max_size_bytes": 209715200,
+        "concurrency": {
+            "global": 60,
+            "per_endpoint": 30,
+            "recovery": 5,
+            "aimd": {
+                "enabled": True,
+                "min": 5,
+                "backoff_factor": 0.5,
+                "additive_increase": 1,
+            },
+        },
+        "terminate_on_observability_failure": False,
+        "shutdown_timeout": "30s",
+        "work_dir": _COMMUNITY_PROCESSOR_WORK_DIR,
+        "db_client": {"type": spec.db_backend},
+        "progress_update_interval": "15s",
+        "dispatch_mode": "async",
+        "async_dispatch": async_dispatch,
+        "resumable": {
+            "lease_duration": "5m",
+            "finalize_concurrency": 16,
+            "finalize_timeout": "30m",
+        },
+        "default_output_expiration_seconds": 7776000,
+        "file_client": _community_file_client(spec),
+        "queue_time_bucket": {"start": 0.1, "factor": 2, "count": 10},
+        "process_time_bucket": {"start": 0.1, "factor": 2, "count": 15},
+        "e2e_latency_bucket": {"start": 1, "factor": 3, "count": 12},
+        "enable_pprof": False,
+        "otel": {"postgresql_tracing": False},
+    }
+
+
+def _community_gc_config(
+    plan: ResolvedRunPlan,
+    spec: BatchGatewaySpec,
+) -> dict[str, Any]:
+    return {
+        "dry_run": False,
+        "collector": {
+            "interval": spec.gc_interval or "30m",
+            "max_concurrency": 10,
+        },
+        "metrics_addr": ":9091",
+        "db_client": {"type": spec.db_backend},
+        "file_client": _community_file_client(spec),
+        "reconciler": {
+            "enabled": True,
+            "interval": "60m",
+            "processor_label_selector": _community_selector_flat(
+                plan, "batch-gateway-processor"
+            ),
+            "processor_statefulset": community_component_name(
+                plan, "processor"
+            ),
+        },
+    }
+
+
+def _community_secret_volumes(spec: BatchGatewaySpec) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "secrets",
+            "projected": {"sources": [{"secret": {"name": spec.secret_name}}]},
+        }
+    ]
+
+
+def _community_secret_mounts() -> list[dict[str, Any]]:
+    return [{"name": "secrets", "mountPath": "/etc/.secrets", "readOnly": True}]
+
+
+def _community_files_volumes(spec: BatchGatewaySpec) -> list[dict[str, Any]]:
+    if not spec.uses_fs_storage:
+        return []
+    return [
+        {
+            "name": "files-storage",
+            "persistentVolumeClaim": {"claimName": spec.fs_claim_name},
+        }
+    ]
+
+
+def _community_files_mounts(spec: BatchGatewaySpec) -> list[dict[str, Any]]:
+    if not spec.uses_fs_storage:
+        return []
+    return [
+        {
+            "name": "files-storage",
+            "mountPath": spec.fs_base_path or _COMMUNITY_FILES_BASE_PATH,
+        }
+    ]
+
+
+def _community_config_configmap(
+    name: str,
+    labels: dict[str, str],
+    namespace: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "data": {
+            "config.yaml": yaml.safe_dump(config, sort_keys=False),
+        },
+    }
+
+
+def _community_service_account(
+    name: str, labels: dict[str, str], namespace: str
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "automountServiceAccountToken": True,
+    }
+
+
+def render_community_apiserver_manifest(
+    plan: ResolvedRunPlan, spec: BatchGatewaySpec
+) -> dict[str, Any]:
+    name = community_component_name(plan, "apiserver")
+    labels = _community_labels(plan, "batch-gateway-apiserver")
+    config = _community_apiserver_config(spec)
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": plan.deployment.namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "replicas": spec.api_server_replicas,
+            "selector": {"matchLabels": _community_selector(
+                plan, "batch-gateway-apiserver"
+            )},
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "checksum/config": hashlib.sha256(
+                            yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "labels": _community_labels(plan, "batch-gateway-apiserver"),
+                },
+                "spec": {
+                    "serviceAccountName": name,
+                    "securityContext": _community_pod_security_context(),
+                    "terminationGracePeriodSeconds": 120,
+                    "containers": [
+                        {
+                            "name": "apiserver",
+                            "image": spec.images["apiserver"],
+                            "imagePullPolicy": "Always",
+                            "securityContext": _community_container_security_context(),
+                            "args": [
+                                "--config=/etc/config/config.yaml",
+                                "--v=2",
+                            ],
+                            "ports": [
+                                {"name": "http", "containerPort": 8000},
+                                {"name": "observability", "containerPort": 8081},
+                            ],
+                            "readinessProbe": {
+                                "httpGet": {
+                                    "path": "/ready",
+                                    "port": "observability",
+                                },
+                                "initialDelaySeconds": 5,
+                                "periodSeconds": 10,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                            "livenessProbe": {
+                                "httpGet": {
+                                    "path": "/health",
+                                    "port": "observability",
+                                },
+                                "initialDelaySeconds": 15,
+                                "periodSeconds": 20,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                            "resources": {
+                                "limits": {"cpu": "1", "memory": "512Mi"},
+                                "requests": {"cpu": "100m", "memory": "128Mi"},
+                            },
+                            "volumeMounts": [
+                                {
+                                    "name": "config",
+                                    "mountPath": "/etc/config",
+                                    "readOnly": True,
+                                },
+                                *_community_files_mounts(spec),
+                                *_community_secret_mounts(),
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {"name": "config", "configMap": {"name": f"{name}-config"}},
+                        *_community_files_volumes(spec),
+                        *_community_secret_volumes(spec),
+                    ],
+                },
+            },
+        },
+    }
+
+
+def render_community_processor_manifest(
+    plan: ResolvedRunPlan,
+    spec: BatchGatewaySpec,
+    *,
+    pool_name: str,
+) -> dict[str, Any]:
+    name = community_component_name(plan, "processor")
+    labels = _community_labels(plan, "batch-gateway-processor")
+    config = _community_processor_config(plan, spec, pool_name=pool_name)
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": name,
+            "namespace": plan.deployment.namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "replicas": spec.processor_replicas,
+            "serviceName": name,
+            "podManagementPolicy": "Parallel",
+            "selector": {"matchLabels": _community_selector(
+                plan, "batch-gateway-processor"
+            )},
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "checksum/config": hashlib.sha256(
+                            yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "labels": _community_labels(plan, "batch-gateway-processor"),
+                },
+                "spec": {
+                    "serviceAccountName": name,
+                    "securityContext": _community_pod_security_context(),
+                    "terminationGracePeriodSeconds": 60,
+                    "containers": [
+                        {
+                            "name": "processor",
+                            "image": spec.images["processor"],
+                            "imagePullPolicy": "Always",
+                            "securityContext": _community_container_security_context(),
+                            "args": [
+                                "--config=/etc/config/config.yaml",
+                                "--v=2",
+                            ],
+                            "ports": [{"name": "metrics", "containerPort": 9090}],
+                            "readinessProbe": {
+                                "httpGet": {"path": "/ready", "port": "metrics"},
+                                "initialDelaySeconds": 5,
+                                "periodSeconds": 10,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                            "livenessProbe": {
+                                "httpGet": {"path": "/health", "port": "metrics"},
+                                "initialDelaySeconds": 15,
+                                "periodSeconds": 20,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                            "resources": {
+                                "limits": {"cpu": "2", "memory": "1Gi"},
+                                "requests": {"cpu": "500m", "memory": "512Mi"},
+                            },
+                            "volumeMounts": [
+                                {
+                                    "name": "config",
+                                    "mountPath": "/etc/config",
+                                    "readOnly": True,
+                                },
+                                {
+                                    "name": "workdir",
+                                    "mountPath": _COMMUNITY_PROCESSOR_WORK_DIR,
+                                },
+                                *_community_files_mounts(spec),
+                                *_community_secret_mounts(),
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {"name": "config", "configMap": {"name": f"{name}-config"}},
+                        {
+                            "name": "workdir",
+                            "emptyDir": {"sizeLimit": _COMMUNITY_PROCESSOR_WORK_DIR_SIZE},
+                        },
+                        *_community_files_volumes(spec),
+                        *_community_secret_volumes(spec),
+                    ],
+                },
+            },
+        },
+    }
+
+
+def render_community_gc_manifest(
+    plan: ResolvedRunPlan, spec: BatchGatewaySpec
+) -> dict[str, Any]:
+    name = community_component_name(plan, "gc")
+    labels = _community_labels(plan, "batch-gateway-gc")
+    config = _community_gc_config(plan, spec)
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": plan.deployment.namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": _community_selector(plan, "batch-gateway-gc")},
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "checksum/config": hashlib.sha256(
+                            yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "labels": _community_labels(plan, "batch-gateway-gc"),
+                },
+                "spec": {
+                    "serviceAccountName": name,
+                    "securityContext": _community_pod_security_context(),
+                    "containers": [
+                        {
+                            "name": "gc",
+                            "image": spec.images["gc"],
+                            "imagePullPolicy": "IfNotPresent",
+                            "securityContext": _community_container_security_context(),
+                            "args": [
+                                "--config=/etc/batch-gc/config.yaml",
+                                "--v=2",
+                            ],
+                            "ports": [{"name": "metrics", "containerPort": 9091}],
+                            "startupProbe": {
+                                "httpGet": {"path": "/health", "port": "metrics"},
+                                "periodSeconds": 5,
+                                "failureThreshold": 60,
+                            },
+                            "livenessProbe": {
+                                "httpGet": {"path": "/health", "port": "metrics"},
+                                "periodSeconds": 30,
+                            },
+                            "resources": {
+                                "limits": {"cpu": "100m", "memory": "128Mi"},
+                                "requests": {"cpu": "10m", "memory": "32Mi"},
+                            },
+                            "volumeMounts": [
+                                {
+                                    "name": "config",
+                                    "mountPath": "/etc/batch-gc",
+                                    "readOnly": True,
+                                },
+                                *_community_files_mounts(spec),
+                                *_community_secret_mounts(),
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {"name": "config", "configMap": {"name": f"{name}-config"}},
+                        *_community_files_volumes(spec),
+                        *_community_secret_volumes(spec),
+                    ],
+                },
+            },
+        },
+    }
+
+
+def _community_async_transport_config(
+    spec: BatchGatewaySpec,
+    *,
+    pool_name: str,
+    model_url: str,
+) -> str:
+    config: dict[str, Any] = {
+        "result_queue_name": f"llm-d-async:results:{pool_name}",
+        "queues": [
+            {
+                "queue_name": f"llm-d-async:requests:{pool_name}",
+                "igw_base_url": model_url,
+                "request_path_url": "/v1/chat/completions",
+                "inference_objective": spec.inference_objective,
+            }
+        ],
+    }
+    if spec.transport == "redis-sortedset":
+        config = {
+            "batch_size": 10,
+            "poll_interval_ms": 500,
+            **config,
+        }
+    # The connection URL is injected through the SQL_URL / REDIS_URL
+    # environment variable so it never lands in rendered manifests.
+    return json.dumps(config)
+
+
+def render_community_llm_d_async_manifest(
+    plan: ResolvedRunPlan,
+    spec: BatchGatewaySpec,
+    *,
+    pool_name: str,
+    model_url: str,
+) -> dict[str, Any]:
+    name = llm_d_async_name(plan)
+    url_env = "SQL_URL" if spec.transport == "sql" else "REDIS_URL"
+    url_key = "postgresql-url" if spec.transport == "sql" else "redis-url"
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": plan.deployment.namespace,
+            "labels": _community_labels(plan, "llm-d-async"),
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": _community_selector(plan, "llm-d-async")},
+            "template": {
+                "metadata": {
+                    "labels": _community_labels(plan, "llm-d-async"),
+                },
+                "spec": {
+                    "serviceAccountName": name,
+                    "securityContext": _community_pod_security_context(),
+                    "containers": [
+                        {
+                            "name": "llm-d-async",
+                            "image": spec.images["async"],
+                            "imagePullPolicy": "Always",
+                            "securityContext": _community_container_security_context(),
+                            "command": ["/llm-d-async"],
+                            "args": [
+                                f"--transport={spec.transport}",
+                                "--transport-config",
+                                _community_async_transport_config(
+                                    spec, pool_name=pool_name, model_url=model_url
+                                ),
+                                "--concurrency=256",
+                                "--gate-wait-timeout=5m",
+                                "--drain-timeout=2m",
+                                "--request-timeout=30m",
+                                "--health-port=8081",
+                                "--metrics-endpoint-auth=false",
+                                "--metrics-port=9090",
+                            ],
+                            "env": [
+                                {"name": "LOG_LEVEL", "value": "info"},
+                                {
+                                    "name": url_env,
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": spec.secret_name,
+                                            "key": url_key,
+                                        }
+                                    },
+                                },
+                            ],
+                            "ports": [
+                                {"name": "metrics", "containerPort": 9090},
+                                {"name": "health", "containerPort": 8081},
+                            ],
+                            "startupProbe": {
+                                "httpGet": {"path": "/healthz", "port": "health"},
+                                "periodSeconds": 2,
+                                "timeoutSeconds": 3,
+                                "failureThreshold": 30,
+                            },
+                            "readinessProbe": {
+                                "httpGet": {"path": "/readyz", "port": "health"},
+                                "initialDelaySeconds": 5,
+                                "periodSeconds": 5,
+                                "timeoutSeconds": 3,
+                                "failureThreshold": 3,
+                            },
+                            "livenessProbe": {
+                                "httpGet": {"path": "/healthz", "port": "health"},
+                                "initialDelaySeconds": 5,
+                                "periodSeconds": 10,
+                                "timeoutSeconds": 3,
+                                "failureThreshold": 3,
+                            },
+                            "resources": {
+                                "limits": {"cpu": "1", "memory": "1Gi"},
+                                "requests": {"cpu": "100m", "memory": "128Mi"},
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+
+def render_community_batch_gateway_manifests(
+    plan: ResolvedRunPlan,
+    *,
+    spec: BatchGatewaySpec,
+    pool_name: str,
+    model_url: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Render every community batch gateway resource for one release.
+
+    Returns (filename, manifest) pairs in apply order. All resources carry
+    the benchflow release labels so cleanup deletes them with the same
+    selector as the operator path.
+    """
+    namespace = plan.deployment.namespace
+    apiserver_name = community_component_name(plan, "apiserver")
+    processor_name = community_component_name(plan, "processor")
+    gc_name = community_component_name(plan, "gc")
+    async_name = llm_d_async_name(plan)
+
+    service_accounts = [
+        _community_service_account(
+            component_name,
+            _community_labels(plan, component),
+            namespace,
+        )
+        for component_name, component in (
+            (apiserver_name, "batch-gateway-apiserver"),
+            (processor_name, "batch-gateway-processor"),
+            (gc_name, "batch-gateway-gc"),
+            (async_name, "llm-d-async"),
+        )
+    ]
+    config_maps = [
+        _community_config_configmap(
+            f"{apiserver_name}-config",
+            _community_labels(plan, "batch-gateway-apiserver"),
+            namespace,
+            _community_apiserver_config(spec),
+        ),
+        _community_config_configmap(
+            f"{processor_name}-config",
+            _community_labels(plan, "batch-gateway-processor"),
+            namespace,
+            _community_processor_config(plan, spec, pool_name=pool_name),
+        ),
+        _community_config_configmap(
+            f"{gc_name}-config",
+            _community_labels(plan, "batch-gateway-gc"),
+            namespace,
+            _community_gc_config(plan, spec),
+        ),
+    ]
+    gc_role = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": {
+            "name": f"{gc_name}-pod-watcher",
+            "namespace": namespace,
+            "labels": _community_labels(plan, "batch-gateway-gc"),
+        },
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list", "watch"],
+            },
+            {
+                "apiGroups": ["apps"],
+                "resources": ["statefulsets"],
+                "verbs": ["get", "list", "watch"],
+            },
+        ],
+    }
+    gc_role_binding = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": f"{gc_name}-pod-watcher",
+            "namespace": namespace,
+            "labels": _community_labels(plan, "batch-gateway-gc"),
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": f"{gc_name}-pod-watcher",
+        },
+        "subjects": [
+            {"kind": "ServiceAccount", "name": gc_name, "namespace": namespace}
+        ],
+    }
+    apiserver_service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": apiserver_name,
+            "namespace": namespace,
+            "labels": _community_labels(plan, "batch-gateway-apiserver"),
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [
+                {"port": 8000, "targetPort": "http", "name": "http"},
+                {"port": 8081, "targetPort": "observability", "name": "observability"},
+            ],
+            "selector": _community_selector(plan, "batch-gateway-apiserver"),
+        },
+    }
+    processor_service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": processor_name,
+            "namespace": namespace,
+            "labels": _community_labels(plan, "batch-gateway-processor"),
+        },
+        "spec": {
+            "clusterIP": "None",
+            "selector": _community_selector(plan, "batch-gateway-processor"),
+        },
+    }
+    workloads = [
+        render_community_apiserver_manifest(plan, spec),
+        render_community_processor_manifest(plan, spec, pool_name=pool_name),
+        render_community_gc_manifest(plan, spec),
+        render_community_llm_d_async_manifest(
+            plan, spec, pool_name=pool_name, model_url=model_url
+        ),
+    ]
+    manifests: list[tuple[str, dict[str, Any]]] = []
+    for name, manifest in zip(
+        (
+            "batch-apiserver-serviceaccount.yaml",
+            "batch-processor-serviceaccount.yaml",
+            "batch-gc-serviceaccount.yaml",
+            "batch-async-serviceaccount.yaml",
+        ),
+        service_accounts,
+        strict=True,
+    ):
+        manifests.append((name, manifest))
+    for name, manifest in zip(
+        (
+            "batch-apiserver-configmap.yaml",
+            "batch-processor-configmap.yaml",
+            "batch-gc-configmap.yaml",
+        ),
+        config_maps,
+        strict=True,
+    ):
+        manifests.append((name, manifest))
+    manifests.append(("batch-gc-role.yaml", gc_role))
+    manifests.append(("batch-gc-rolebinding.yaml", gc_role_binding))
+    for name, manifest in zip(
+        (
+            "batch-apiserver-deployment.yaml",
+            "batch-processor-statefulset.yaml",
+            "batch-gc-deployment.yaml",
+            "batch-async-deployment.yaml",
+        ),
+        workloads,
+        strict=True,
+    ):
+        manifests.append((name, manifest))
+    manifests.append(("batch-apiserver-service.yaml", apiserver_service))
+    manifests.append(("batch-processor-service.yaml", processor_service))
+    return manifests
+
+
+def wait_for_community_batch_gateway_ready(
+    kubectl_cmd: str,
+    plan: ResolvedRunPlan,
+    spec: BatchGatewaySpec,
+    *,
+    timeout_seconds: int,
+) -> None:
+    targets = [
+        ("deployment", community_component_name(plan, "apiserver")),
+        ("statefulset", community_component_name(plan, "processor")),
+        ("deployment", community_component_name(plan, "gc")),
+        ("deployment", llm_d_async_name(plan)),
+    ]
+    namespace = plan.deployment.namespace
+    pending = list(targets)
+    deadline = time.time() + timeout_seconds
+    reported: set[tuple[str, str]] = set()
+    while time.time() < deadline and pending:
+        still_pending: list[tuple[str, str]] = []
+        for kind, name in pending:
+            result = run_command(
+                [kubectl_cmd, "get", kind, name, "-n", namespace, "-o", "json"],
+                capture_output=True,
+                check=False,
+            )
+            ready = False
+            if result.returncode == 0:
+                try:
+                    payload = json.loads(result.stdout or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                status = payload.get("status") or {}
+                ready = int(status.get("readyReplicas") or 0) >= 1 and not (
+                    payload.get("spec", {}).get("replicas", 1) > 0
+                    and int(status.get("replicas") or 0) == 0
+                )
+            if not ready:
+                still_pending.append((kind, name))
+                if (kind, name) not in reported:
+                    detail(f"Waiting for community batch gateway {kind} {name}")
+                    reported.add((kind, name))
+        pending = still_pending
+        if pending:
+            time.sleep(10)
+    if pending:
+        raise CommandError(
+            "timed out waiting for the community batch gateway: "
+            + ", ".join(f"{kind}/{name}" for kind, name in pending)
+        )
+
+
 def render_batch_route_manifests(
     plan: ResolvedRunPlan,
     *,
@@ -1125,7 +2123,13 @@ def _write_manifest(
     detail(f"Rendered batch gateway manifest written to {target}")
 
 
-def _require_secret(kubectl_cmd: str, namespace: str, secret_name: str) -> None:
+def _require_secret(
+    kubectl_cmd: str,
+    namespace: str,
+    secret_name: str,
+    *,
+    required_keys: tuple[str, ...] = (),
+) -> None:
     result = run_command(
         [
             kubectl_cmd,
@@ -1135,19 +2139,32 @@ def _require_secret(kubectl_cmd: str, namespace: str, secret_name: str) -> None:
             "-n",
             namespace,
             "-o",
-            "name",
+            "json",
         ],
         capture_output=True,
         check=False,
     )
-    if result.returncode == 0:
+    if result.returncode != 0:
+        raise CommandError(
+            f"Secret {secret_name} is required in namespace {namespace} before the "
+            "batch gateway can be deployed. Create it with the redis-url and "
+            "postgresql-url keys (see docs/RHOAI_BATCH_GATEWAY.md and the upstream "
+            f"guide {_UPSTREAM_GUIDE_URL}, section 3.9)"
+        )
+    if not required_keys:
         return
-    raise CommandError(
-        f"Secret {secret_name} is required in namespace {namespace} before the "
-        "batch gateway can be deployed. Create it with the redis-url and "
-        "postgresql-url keys (see docs/RHOAI_BATCH_GATEWAY.md and the upstream "
-        f"guide {_UPSTREAM_GUIDE_URL}, section 3.9)"
-    )
+    try:
+        payload = json.loads(result.stdout or "{}")
+        present = set((payload.get("data") or {}).keys())
+    except json.JSONDecodeError:
+        present = set()
+    missing = [key for key in required_keys if key not in present]
+    if missing:
+        raise CommandError(
+            f"Secret {secret_name} in namespace {namespace} is missing the "
+            + ", ".join(missing)
+            + " key(s) required by the configured batch gateway transport"
+        )
 
 
 def _ensure_namespace_gateway_label(kubectl_cmd: str, namespace: str) -> None:
@@ -1228,11 +2245,19 @@ def deploy_rhoai_batch_gateway(
     release_name = plan.deployment.release_name
 
     step("Validating batch gateway prerequisites")
-    _require_secret(kubectl_cmd, namespace, spec.secret_name)
-    api_version = llmbatchgateway_api_version(kubectl_cmd)
+    secret_keys: tuple[str, ...] = ("postgresql-url",)
+    if spec.transport == "redis-sortedset" and spec.community_implementation:
+        secret_keys = ("postgresql-url", "redis-url")
+    _require_secret(
+        kubectl_cmd, namespace, spec.secret_name, required_keys=secret_keys
+    )
+    if spec.community_implementation:
+        api_version = ""
+    else:
+        api_version = llmbatchgateway_api_version(kubectl_cmd)
+        detail(f"LLMBatchGateway API: {api_version}")
     objective_api_version = inference_objective_api_version(kubectl_cmd)
     pool_group = inference_pool_group(kubectl_cmd)
-    detail(f"LLMBatchGateway API: {api_version}")
 
     step("Preparing the batch internal Gateway")
     _ensure_namespace_gateway_label(kubectl_cmd, namespace)
@@ -1278,40 +2303,86 @@ def deploy_rhoai_batch_gateway(
     )
     _apply_manifest(kubectl_cmd, objective)
     _write_manifest(manifests_dir, "batch-inference-objective.yaml", objective)
+    if spec.interactive_objective:
+        interactive_objective = render_batch_inference_objective_manifest(
+            plan,
+            spec=spec,
+            api_version=objective_api_version,
+            pool_group=pool_group,
+            pool_name=pool_name,
+            name=spec.interactive_objective,
+            priority=0,
+            component="interactive-inference-objective",
+        )
+        _apply_manifest(kubectl_cmd, interactive_objective)
+        _write_manifest(
+            manifests_dir, "interactive-inference-objective.yaml", interactive_objective
+        )
     llm_route = render_batch_llm_route_manifest(
         plan, pool_group=pool_group, pool_name=pool_name
     )
     _apply_manifest(kubectl_cmd, llm_route)
     _write_manifest(manifests_dir, "batch-llm-route.yaml", llm_route)
-    llm_route_auth = render_batch_llm_route_authpolicy(plan)
-    _apply_manifest(kubectl_cmd, llm_route_auth, graceful_missing_kind=True)
-    _write_manifest(manifests_dir, "batch-llm-route-authpolicy.yaml", llm_route_auth)
+    if spec.internal_route_auth:
+        llm_route_auth = render_batch_llm_route_authpolicy(plan)
+        _apply_manifest(kubectl_cmd, llm_route_auth, graceful_missing_kind=True)
+        _write_manifest(
+            manifests_dir, "batch-llm-route-authpolicy.yaml", llm_route_auth
+        )
+    else:
+        detail(
+            "Internal route authentication is disabled for this release "
+            "(options.batch_gateway.internal_route_auth: false)"
+        )
 
-    step(f"Applying LLMBatchGateway {llmbatchgateway_name(plan)}")
-    batch_gateway = render_llmbatchgateway_manifest(
-        plan,
-        spec=spec,
-        api_version=api_version,
-        pool_name=pool_name,
-        model_url=model_url,
-    )
-    _apply_manifest(kubectl_cmd, batch_gateway)
-    _write_manifest(manifests_dir, "llmbatchgateway.yaml", batch_gateway)
-    wait_for_llmbatchgateway_ready(
-        kubectl_cmd,
-        namespace=namespace,
-        name=llmbatchgateway_name(plan),
-        timeout_seconds=timeout_seconds,
-    )
-    success(f"LLMBatchGateway {llmbatchgateway_name(plan)} is ready")
+    if spec.community_implementation:
+        step("Applying the community batch gateway components")
+        community_manifests = render_community_batch_gateway_manifests(
+            plan,
+            spec=spec,
+            pool_name=pool_name,
+            model_url=model_url,
+        )
+        for filename, manifest in community_manifests:
+            _apply_manifest(kubectl_cmd, manifest)
+            _write_manifest(manifests_dir, filename, manifest)
+        wait_for_community_batch_gateway_ready(
+            kubectl_cmd,
+            plan,
+            spec,
+            timeout_seconds=timeout_seconds,
+        )
+        success(
+            "Community batch gateway components are ready "
+            f"(transport: {spec.transport})"
+        )
+        apiserver_service = community_component_name(plan, "apiserver")
+    else:
+        step(f"Applying LLMBatchGateway {llmbatchgateway_name(plan)}")
+        batch_gateway = render_llmbatchgateway_manifest(
+            plan,
+            spec=spec,
+            api_version=api_version,
+            pool_name=pool_name,
+            model_url=model_url,
+        )
+        _apply_manifest(kubectl_cmd, batch_gateway)
+        _write_manifest(manifests_dir, "llmbatchgateway.yaml", batch_gateway)
+        wait_for_llmbatchgateway_ready(
+            kubectl_cmd,
+            namespace=namespace,
+            name=llmbatchgateway_name(plan),
+            timeout_seconds=timeout_seconds,
+        )
+        success(f"LLMBatchGateway {llmbatchgateway_name(plan)} is ready")
+        apiserver_service = discover_batch_apiserver_service(
+            kubectl_cmd,
+            namespace=namespace,
+            cr_name=llmbatchgateway_name(plan),
+            timeout_seconds=600,
+        )
 
     step("Exposing the batch API on the release Gateway")
-    apiserver_service = discover_batch_apiserver_service(
-        kubectl_cmd,
-        namespace=namespace,
-        cr_name=llmbatchgateway_name(plan),
-        timeout_seconds=600,
-    )
     detail(f"Batch apiserver Service: {namespace}/{apiserver_service}")
     route_manifests = render_batch_route_manifests(
         plan,
@@ -1389,6 +2460,13 @@ def cleanup_rhoai_batch_gateway(
         ("httproute", namespace),
         ("inferenceobjective", namespace),
         ("authpolicy", namespace),
+        ("deployment", namespace),
+        ("statefulset", namespace),
+        ("configmap", namespace),
+        ("service", namespace),
+        ("serviceaccount", namespace),
+        ("role.rbac.authorization.k8s.io", namespace),
+        ("rolebinding.rbac.authorization.k8s.io", namespace),
         ("pvc", namespace),
         ("gateway", RHOAI_GATEWAY_NAMESPACE),
         ("destinationrule", RHOAI_GATEWAY_NAMESPACE),
@@ -1407,6 +2485,7 @@ def cleanup_rhoai_batch_gateway(
             check=False,
         )
     detail(
-        "Removed batch gateway routes, policies, objectives, the internal "
-        "Gateway, and benchflow-created batch files PVCs"
+        "Removed batch gateway routes, policies, objectives, workloads "
+        "(operator or community components), the internal Gateway, and "
+        "benchflow-created batch files PVCs"
     )

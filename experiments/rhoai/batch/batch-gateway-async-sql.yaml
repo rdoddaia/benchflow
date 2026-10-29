@@ -1,0 +1,41 @@
+# Deploys the YaRN-scaled Qwen3-32B copy on TP8 with the community batch
+# gateway (BenchFlow-rendered llm-d components) in async dispatch over the
+# PostgreSQL SQL queue transport, behind the RHOAI 3.5 LLMInferenceService
+# with the community EPP v0.10.0 running the SCR policy (cap 128, TTL 45s,
+# eviction on). This is the old-report stack shape rebuilt on the operator
+# path; drive it with the cybergym drivers (see HANDOVER.md).
+apiVersion: benchflow.io/v1alpha1
+kind: Experiment
+metadata:
+  name: batch-gateway-async-sql
+spec:
+  model:
+    name:
+      - Qwen/Qwen3-32B
+  deployment_profile: batch-gateway-async-sql
+  benchmark_profile: guidellm-smoke
+  metrics_profile: detailed
+  namespace: benchflow
+  stages:
+    # BenchFlow does not drive the /v1/batches API itself yet; the cybergym
+    # batch + interactive drivers run outside BenchFlow.
+    benchmark: false
+  overrides:
+    runtime:
+      # Diadochos validation is pinned to mt46x; its 8 H100s are freed by
+      # tearing down the sync release before deploying this experiment.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - diadochos-hqxzk-gpu-h100-mt46x
+  mlflow:
+    tags:
+      accelerator: H100
+      topology: tp8
+  execution:
+    timeout: 4h
