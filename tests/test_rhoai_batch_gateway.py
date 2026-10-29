@@ -80,6 +80,26 @@ def test_batch_experiments_resolve_with_batch_profiles() -> None:
         assert plan.stages.benchmark is False
 
 
+def test_batch_gateway_36_experiment_resolves_with_ea_profile() -> None:
+    plan = _plans("batch-gateway-36-async")[0]
+    assert plan.profiles.deployment == "batch-gateway-36-async"
+    assert plan.deployment.platform == "rhoai"
+    assert plan.deployment.mode == "distributed-default"
+    assert plan.deployment.platform_version == "RHOAI-3.6.0-ea.2"
+    assert plan.deployment.platform_channel == "beta"
+    assert plan.stages.benchmark is False
+    batch_gateway = plan.deployment.options["batch_gateway"]
+    # The ea.2 apiserver needs the tenant input header on every call.
+    assert batch_gateway["api_server"]["config"]["inputHeaders"] == {
+        "tenant": "X-MaaS-Username"
+    }
+    # ea.2 CRD requires resultPollTimeout for async dispatch and defaults
+    # concurrency to 8; the profile pins the benchmarked values.
+    async_config = batch_gateway["async_config"]
+    assert async_config["resultPollTimeout"] == "30s"
+    assert async_config["concurrency"] == 256
+
+
 def test_parse_batch_gateway_options_sync_defaults() -> None:
     parsed = parse_batch_gateway_options(
         {
@@ -104,6 +124,60 @@ def test_parse_batch_gateway_options_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="unsupported fields: color"):
         parse_batch_gateway_options(
             {"secret_name": "s", "file_storage": {"fs": {}}, "color": "blue"}
+        )
+
+
+def test_parse_batch_gateway_options_api_server_passthrough() -> None:
+    config = {
+        "inputHeaders": {"tenant": "X-MaaS-Username"},
+        "batchAPI": {"passThroughHeaders": ["Authorization"]},
+    }
+    parsed = parse_batch_gateway_options(
+        {
+            "secret_name": "s",
+            "file_storage": {"fs": {}},
+            "api_server": {"config": config},
+        }
+    )
+    assert parsed["api_server"] == {"config": config}
+    # Absent by default: older CRDs prune unknown spec.apiServer fields, so
+    # profiles on RHOAI 3.5 simply omit the option.
+    parsed = parse_batch_gateway_options(
+        {"secret_name": "s", "file_storage": {"fs": {}}}
+    )
+    assert parsed["api_server"] == {}
+
+
+def test_parse_batch_gateway_options_rejects_bad_api_server() -> None:
+    # replicas is deliberately not passable here (api_server_replicas is
+    # the knob) so typos cannot silently shadow it.
+    with pytest.raises(
+        ValidationError, match="api_server contains unsupported fields: replicas"
+    ):
+        parse_batch_gateway_options(
+            {
+                "secret_name": "s",
+                "file_storage": {"fs": {}},
+                "api_server": {"replicas": 2},
+            }
+        )
+    with pytest.raises(
+        ValidationError, match="api_server.config must be a non-empty mapping"
+    ):
+        parse_batch_gateway_options(
+            {
+                "secret_name": "s",
+                "file_storage": {"fs": {}},
+                "api_server": {"config": {}},
+            }
+        )
+    with pytest.raises(ValidationError, match="api_server must be a mapping"):
+        parse_batch_gateway_options(
+            {
+                "secret_name": "s",
+                "file_storage": {"fs": {}},
+                "api_server": "fast",
+            }
         )
 
 
@@ -277,6 +351,34 @@ def test_render_llmbatchgateway_async_manifest_injects_release_defaults() -> Non
     assert queue["igwBaseURL"] == TEST_MODEL_URL
     # local-max-concurrency gates keep their params untouched.
     assert queue["gateParams"] == {"limit": "256"}
+
+
+def test_render_llmbatchgateway_36_async_manifest_carries_api_server_config() -> None:
+    plan = _plans("batch-gateway-36-async")[0]
+    spec = rhoai_batch_gateway_spec(plan)
+    assert spec.dispatch_mode == "async"
+    manifest = render_llmbatchgateway_manifest(
+        plan,
+        spec=spec,
+        api_version=TEST_API_VERSION,
+        pool_name=TEST_POOL_NAME,
+        model_url=TEST_MODEL_URL,
+    )
+    # apiServer keeps the replicas knob and merges the pass-through config.
+    api_server = manifest["spec"]["apiServer"]
+    assert api_server["replicas"] == 1
+    assert api_server["config"] == {
+        "inputHeaders": {"tenant": "X-MaaS-Username"},
+        "batchAPI": {"passThroughHeaders": ["Authorization"]},
+    }
+    # ea.2 CRD requirements ride through the async_config passthrough
+    # unchanged alongside the release-derived queue identity.
+    async_config = manifest["spec"]["processor"]["asyncConfig"]
+    assert async_config["resultPollTimeout"] == "30s"
+    assert async_config["concurrency"] == 256
+    queue = async_config["redis"]["queuesConfig"][0]
+    assert queue["name"] == f"llm-d-async:requests:{TEST_POOL_NAME}"
+    assert queue["igwBaseURL"] == TEST_MODEL_URL
 
 
 def test_async_prometheus_budget_gate_gets_pool_injection() -> None:

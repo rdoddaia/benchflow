@@ -1,0 +1,49 @@
+# Deploys the YaRN-scaled Qwen3-32B copy on TP8 with the operator-managed
+# RHOAI 3.6.0-ea.2 batch gateway in async dispatch mode (Redis queues,
+# local-max-concurrency gates, no Prometheus dependency) — the fully-product
+# 3.6 arm: kserve renders the serving path from ea.2 product images
+# (llm-d-router EPP + vllm-cuda-rhel9) and the LLMBatchGateway CR drives the
+# platform operator's operands. BenchFlow deploys the stack and prints the
+# /v1/batches endpoint; every apiserver call needs the X-MaaS-Username tenant
+# header (set on the CR via the profile's api_server config). Drive the batch
+# API with an external client (see docs/RHOAI_BATCH_GATEWAY.md and
+# BatchWorkload/dodo-validation/smoke-test-36-async.sh).
+#
+# NOTE: on ea.2 images the operator's bundled batch-gateway chart drops
+# async_dispatch.models (processor crashloop); apply the mounted-chart
+# workaround from BatchWorkload/dodo-validation/chart-fix/ first — see
+# RHOAI_BATCH_GATEWAY_WORK.md §9.
+apiVersion: benchflow.io/v1alpha1
+kind: Experiment
+metadata:
+  name: batch-gateway-36-async
+spec:
+  model:
+    name:
+      - Qwen/Qwen3-32B
+  deployment_profile: batch-gateway-36-async
+  benchmark_profile: guidellm-smoke
+  metrics_profile: detailed
+  namespace: benchflow
+  stages:
+    # BenchFlow does not drive the /v1/batches API itself yet.
+    benchmark: false
+  overrides:
+    runtime:
+      # Diadochos validation is pinned to mt46x; its 8 H100s are freed by
+      # scaling the legacy cybergym-vllm deployment in batch-bench to zero.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - diadochos-hqxzk-gpu-h100-mt46x
+  mlflow:
+    tags:
+      accelerator: H100
+      topology: tp8
+  execution:
+    timeout: 4h

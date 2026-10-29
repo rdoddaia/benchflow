@@ -52,6 +52,7 @@ _BATCH_GATEWAY_OPTION_KEYS = {
     "db_backend",
     "file_storage",
     "api_server_replicas",
+    "api_server",
     "processor_replicas",
     "dispatch_mode",
     "implementation",
@@ -104,6 +105,10 @@ class BatchGatewaySpec:
     images: dict[str, str] = field(default_factory=dict)
     interactive_objective: str = ""
     internal_route_auth: bool = True
+    # Pass-through spec.apiServer fields beyond replicas (e.g. config with
+    # the tenant input header); the RHOAI 3.6 CRD accepts them, older CRDs
+    # prune unknown fields silently.
+    api_server: dict[str, Any] = field(default_factory=dict)
 
     @property
     def community_implementation(self) -> bool:
@@ -297,6 +302,33 @@ def _parse_tls(raw: Any) -> dict[str, Any]:
     return deepcopy(raw)
 
 
+def _parse_api_server(raw: Any) -> dict[str, Any]:
+    """Parse the optional apiServer pass-through (beyond replicas).
+
+    The RHOAI 3.6 CRD exposes spec.apiServer.config (tenant input header,
+    batch-API passthrough headers); profiles on older platforms simply omit
+    the option.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValidationError("options.batch_gateway.api_server must be a mapping")
+    unknown = sorted(set(raw) - {"config"})
+    if unknown:
+        raise ValidationError(
+            "options.batch_gateway.api_server contains unsupported fields: "
+            + ", ".join(unknown)
+        )
+    config = raw.get("config")
+    if config is None:
+        return {}
+    if not isinstance(config, dict) or not config:
+        raise ValidationError(
+            "options.batch_gateway.api_server.config must be a non-empty mapping"
+        )
+    return {"config": deepcopy(config)}
+
+
 def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
     """Validate and normalize the profile options.batch_gateway mapping.
 
@@ -372,6 +404,7 @@ def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
         raw.get("async_config"), dispatch_mode, derived=implementation == "community"
     )
     tls = _parse_tls(raw.get("tls"))
+    api_server = _parse_api_server(raw.get("api_server"))
 
     gc_interval = raw.get("gc_interval")
     if gc_interval is None:
@@ -419,6 +452,7 @@ def parse_batch_gateway_options(raw: Any) -> dict[str, Any]:
         "images": images,
         "interactive_objective": interactive_objective,
         "internal_route_auth": internal_route_auth,
+        "api_server": api_server,
     }
 
 
@@ -468,6 +502,7 @@ def rhoai_batch_gateway_spec(plan: ResolvedRunPlan) -> BatchGatewaySpec | None:
         images=parsed["images"],
         interactive_objective=parsed["interactive_objective"],
         internal_route_auth=parsed["internal_route_auth"],
+        api_server=parsed["api_server"],
     )
 
 
@@ -1077,6 +1112,10 @@ def render_llmbatchgateway_manifest(
     else:
         file_storage = {"s3": deepcopy(spec.file_storage.get("s3") or {})}
 
+    api_server: dict[str, Any] = {"replicas": spec.api_server_replicas}
+    if spec.api_server:
+        api_server.update(deepcopy(spec.api_server))
+
     manifest: dict[str, Any] = {
         "apiVersion": api_version,
         "kind": "LLMBatchGateway",
@@ -1089,7 +1128,7 @@ def render_llmbatchgateway_manifest(
             "secretRef": {"name": spec.secret_name},
             "dbBackend": spec.db_backend,
             "fileStorage": file_storage,
-            "apiServer": {"replicas": spec.api_server_replicas},
+            "apiServer": api_server,
             "processor": processor,
         },
     }

@@ -1,0 +1,121 @@
+# Operator-managed RHOAI 3.6 batch gateway, async dispatch over Redis —
+# the fully-product 3.6.0-ea.2 arm validated on dodo (2026-10-29): the
+# LLMBatchGateway CR drives the platform operator's operands (apiserver,
+# processor, gc, llm-d-async), kserve renders the serving path from product
+# images (llm-d-router EPP + vllm-cuda-rhel9), and the processor enqueues
+# requests in Redis for llm-d-async to drain through the internal Gateway.
+#
+# Differences vs batch-gateway-async (RHOAI 3.5) required by the ea.2 CRD:
+# - async_config.resultPollTimeout is REQUIRED when dispatchMode is async
+#   (CRD validation rejects the CR without it); 30s matches the handoff doc
+#   and the benchmarked SQL arm's core processor config.
+# - async_config.concurrency must be pinned: the ea.2 CRD schema defaults it
+#   to 8 (the async chart's default is 64); the benchmarked SQL arm runs 256.
+# - api_server.config sets the tenant input header the ea.2 apiserver needs
+#   (X-MaaS-Username) plus the Authorization passthrough.
+#
+# Serving shape mirrors batch-gateway-async-sql (YaRN-scaled Qwen3-32B copy
+# at --max-model-len=131072) but with the ea.2 product scheduler and engine
+# images, so the 3.6 arm is product end to end. Requires the
+# batch-gateway-secrets Secret (redis-url, postgresql-url) in the deployment
+# namespace; see docs/RHOAI_BATCH_GATEWAY.md.
+#
+# NOTE (ea.2 chart bug, 2026-10-29): the operator image bundles a
+# batch-gateway chart whose processor-configmap template drops
+# async_dispatch.models, crashlooping the processor in async mode. Until the
+# image ships a fixed chart, apply the mounted-chart workaround from
+# BatchWorkload/dodo-validation/chart-fix/ (ConfigMaps + deployment patch
+# shadowing /charts/batch-gateway). See RHOAI_BATCH_GATEWAY_WORK.md §9.
+apiVersion: benchflow.io/v1alpha1
+kind: DeploymentProfile
+metadata:
+  name: batch-gateway-36-async
+spec:
+  platform: rhoai
+  mode: distributed-default
+  platform_version: RHOAI-3.6.0-ea.2
+  platform_channel: beta
+  endpoint_path: /v1/models
+  scheduler_image: registry.redhat.io/rhoai/odh-llm-d-router-endpoint-picker-rhel9@sha256:bcce18e4793c15c3c8f3bfc5d0a9158c672c88720adc471caf3b66b534667615
+  model_storage:
+    # hostPath PV backed by the mt46x NVMe models directory; contains the
+    # YaRN-scaled copy the SQL arm serves (plain Qwen3-32B caps at 40960).
+    pvc_name: benchflow-models-mt46x
+    cache_dir: ""
+    model_subpath: Qwen-Qwen3-32B-yarn
+  runtime:
+    # ea.2 product engine (vLLM v0.28.0); the ISVC controller adds the TLS
+    # flags on top of these args.
+    image: registry.redhat.io/rhaii-fast/vllm-cuda-rhel9@sha256:97c7d6f66f3f0897b3ff10ddd135de930d45bdd116cf41a43e3ad7270029116a
+    replicas: 1
+    tensor_parallelism: 8
+    env:
+      USER: benchflow
+      LOGNAME: benchflow
+      HOME: /tmp
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      CUDA_MODULE_LOADING: LAZY
+      # vLLM compares --max-model-len against the raw config value
+      # (40960); the YaRN-scaled effective context needs this escape hatch.
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+    vllm_args:
+      - --max-model-len=131072
+      - --max-num-seqs=256
+      - --gpu-memory-utilization=0.90
+      - --trust-remote-code
+      - --enable-prefix-caching
+      - --tool-call-parser=qwen3_xml
+      - --enable-auto-tool-choice
+  options:
+    enable_auth: false
+    batch_gateway:
+      secret_name: batch-gateway-secrets
+      db_backend: postgresql
+      dispatch_mode: async
+      # Tenant header + passthrough for the ea.2 apiserver; mirrors the
+      # handoff doc's CR example and the validated dodo deployment.
+      api_server:
+        config:
+          inputHeaders:
+            tenant: X-MaaS-Username
+          batchAPI:
+            passThroughHeaders:
+              - Authorization
+      file_storage:
+        fs:
+          # claim_name defaults to <release>-batch-gateway-files; BenchFlow
+          # creates the 20Gi ReadWriteMany PVC when it does not exist.
+          base_path: /tmp/batch-gateway
+          # The PVC must be ReadWriteMany; pin the class on clusters whose
+          # default StorageClass is block/RWO (Diadochos defaults to
+          # ibmc-vpc-block, so the profiles pin its CephFS class).
+          storage_class_name: rook-cephfs-fast
+      # async_config passes through to the LLMBatchGateway CR except that
+      # BenchFlow fills in release-derived fields the profile cannot know:
+      # each queue's name, igwBaseURL, and (for prometheus-budget gates) the
+      # gateParams pool and namespace.
+      async_config:
+        replicas: 1
+        # REQUIRED by the ea.2 CRD for dispatch_mode: async.
+        resultPollTimeout: 30s
+        # CRD schema default is 8; the benchmarked SQL arm runs 256.
+        concurrency: 256
+        redis:
+          requestPathURL: /v1/chat/completions
+          pollIntervalMs: 1000
+          batchSize: 10
+          queuesConfig:
+            - requestPathURL: /v1/chat/completions
+              # Queue gate caps in-flight dispatch at the engine ceiling
+              # (max_num_seqs 256) without consulting Prometheus.
+              gateType: local-max-concurrency
+              gateParams:
+                limit: "256"
+              workerPoolID: default-workers
+        workerPools:
+          - name: default-workers
+            workers: 4
+            gateType: local-max-concurrency
+            # 4 workers x 64 = 256, aligned with the queue gate limit.
+            gateParams:
+              limit: "64"
