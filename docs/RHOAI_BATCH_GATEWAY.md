@@ -35,17 +35,27 @@ Two deployment profiles exercise the two dispatch modes:
   the llm-d components directly, the EPP runs the SCR flow-control policy with
   in-flight eviction, and the runtime serves the YaRN-scaled Qwen3-32B copy at
   131072 context with report-era vLLM v0.26.0 flags.
+- `profiles/deployment/rhoai/batch/batch-gateway-36-async.yaml` — the fully
+  product RHOAI 3.6.0-ea.2 arm: product scheduler and engine images
+  (digest-pinned ea.2 EPP + vLLM v0.28.0), the YaRN-scaled Qwen3-32B copy at
+  131072 context, `api_server.config` with the `X-MaaS-Username` tenant
+  header, and the ea.2 CRD requirements pinned in `async_config`
+  (`resultPollTimeout: 30s`, `concurrency: 256` — the ea.2 CRD defaults
+  concurrency to 8). Every apiserver call on this CR needs the tenant header.
 
-Both pin `RHOAI-3.5.0` / channel `stable-3.5` — the stable line the upstream
+The sync/async/sql profiles pin `RHOAI-3.5.0` / channel `stable-3.5` — the
+stable line the upstream
 deploy-rhoai.md recipe targets, whose operator already ships the batch-gateway
 operator (`aigateway.batchGateway`) — and mirror the Diadochos serving runtime
 (Qwen3-32B, TP8, vLLM 0.31.0, `max_num_seqs=256`, native 40960 context — the
 legacy stack reaches 131072 only via a locally YaRN-scaled model copy). The
 exact version pin keeps the installed-key fast path matching the cluster's
-recorded platform state.
+recorded platform state. The 3.6 profile pins `RHOAI-3.6.0-ea.2` / `beta`
+instead (it also serves the YaRN copy, hence the product engine pin).
 
-Example experiments: `experiments/rhoai/batch/batch-gateway-{sync,async}.yaml`.
-They disable the benchmark stage because the batch drivers are external.
+Example experiments:
+`experiments/rhoai/batch/batch-gateway-{sync,async,36-async}.yaml`. They
+disable the benchmark stage because the batch drivers are external.
 
 ## Prerequisites
 
@@ -220,6 +230,7 @@ both required).
 | `interactive_objective` | unset | optional; renders an additional priority-0 InferenceObjective with this name |
 | `internal_route_auth` | `true` | when false, skips the llm-route AuthPolicy (unauthenticated internal path) |
 | `api_server_replicas` | `1` | |
+| `api_server` | unset | `{config}` passthrough into `spec.apiServer` beyond `replicas` (RHOAI 3.6+: tenant input header, batch-API passthrough headers) |
 | `processor_replicas` | `1` | |
 | `request_timeout` | `5m` | sync only |
 | `max_retries` | `3` | sync only |
